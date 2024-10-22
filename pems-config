@@ -1,0 +1,23 @@
+[credentials]
+username = your_username
+password = your_password
+
+[download_settings]
+output_dir = pems_data
+# Optional: Set to blank for current date
+end_date = 
+# Optional: Set to blank for 1 year before end_date
+start_date = 
+delay_between_requests = 2
+
+[districts]
+# Set to true/false to enable/disable specific districts
+d3 = true
+d4 = true
+d5 = true
+d6 = true
+d7 = true
+d8 = true
+d10 = true
+d11 = true
+d12 = true
