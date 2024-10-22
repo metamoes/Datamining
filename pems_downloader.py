@@ -197,101 +197,90 @@ class PeMSDownloader:
         return sorted(districts)
 
     def get_stations(self, district: str) -> List[Dict]:
-        """Get list of stations for a district"""
+        """Get list of stations by accessing the station_5min data type"""
         try:
-            # Build URL for station list
-            station_url = f"{self.base_url}/clearinghouse/district_stations.php?district_id={district}"
-            response = self.session.get(station_url, verify=False)
-            
+            # First access the clearinghouse page with proper parameters
+            url = "https://pems.dot.ca.gov/"
+            params = {
+                'dnode': 'Clearinghouse',
+                'type': 'station_5min',
+                'district_id': district,
+                'submit': 'Submit'
+            }
+
+            self.logger.info(f"Accessing clearinghouse with params: {params}")
+            response = self.session.get(url, params=params, verify=False)
+
             if response.status_code != 200:
-                self.logger.error(f"Failed to get stations for district {district}")
+                self.logger.error(f"Failed to access clearinghouse. Status: {response.status_code}")
                 return []
 
-            # Parse HTML response
+            # Parse HTML for available stations
             soup = BeautifulSoup(response.text, 'html.parser')
+
+            # Get the data files table
+            data_table = soup.find('table', {'id': 'datafiles'})
+            if not data_table:
+                self.logger.error("Could not find data files table")
+                return []
+
             stations = []
-            
-            # Find the station table and parse rows
-            # Note: You'll need to adjust these selectors based on actual HTML structure
-            station_table = soup.find('table', {'id': 'stations'})
-            if station_table:
-                for row in station_table.find_all('tr')[1:]:  # Skip header row
-                    cols = row.find_all('td')
-                    if len(cols) >= 3:
-                        station_info = {
-                            'id': cols[0].text.strip(),
-                            'name': cols[1].text.strip(),
-                            'type': cols[2].text.strip()
-                        }
-                        stations.append(station_info)
-            
-            self.logger.info(f"Found {len(stations)} stations in district {district}")
+            for row in data_table.find_all('tr')[1:]:  # Skip header
+                cols = row.find_all('td')
+                if len(cols) >= 2:
+                    filename = cols[0].find('a')['href']
+                    file_id = filename.split('download=')[1].split('&')[0]
+
+                    station_info = {
+                        'id': f"station_{file_id}",
+                        'name': filename,
+                        'type': 'station'
+                    }
+                    stations.append(station_info)
+
+            self.logger.info(f"Found {len(stations)} files for district {district}")
             return stations
 
         except Exception as e:
             self.logger.error(f"Error getting stations for district {district}: {str(e)}")
+            self.logger.error(f"Full error details: {str(e.__class__.__name__)}: {str(e)}")
             return []
 
     def download_station_data(self, district: str, station: Dict, current_date: datetime) -> bool:
-        """Download data for a specific station and date"""
+        """Download station data file directly from clearinghouse"""
         try:
-            # Format date for URL
-            date_str = current_date.strftime("%Y%m%d")
+            # Format date for filename
+            date_str = current_date.strftime("%Y_%m_%d")
 
-            # Updated clearinghouse URL structure
-            download_url = (f"https://pems.dot.ca.gov/clearinghouse/station_data/"
-                            f"download/{district}/{station['id']}/{date_str}")
+            # Build download URL
+            download_url = f"https://pems.dot.ca.gov/?download={station['id'].split('_')[1]}&dnode=Clearinghouse"
 
-            # Create output path
+            # Create output path using district/date structure
             output_path = (self.output_dir / 'raw_data' / district /
-                           station['id'] / f"{date_str}.txt.gz")
+                           date_str / f"{station['name']}")
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
-            self.logger.info(f"Attempting download from: {download_url}")
+            # Download file with progress logging
+            self.logger.info(f"Downloading {download_url} to {output_path}")
 
-            # Download file
             response = self.session.get(download_url, stream=True, verify=False)
-
-            if response.status_code == 200 and len(response.content) > 100:  # Basic size check
+            if response.status_code == 200:
                 with open(output_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                        if chunk:
+                            f.write(chunk)
 
-                # Update metadata
-                if district not in self.metadata['districts']:
-                    self.metadata['districts'][district] = {
-                        'total_stations': 0,
-                        'processed_stations': 0
-                    }
-
-                if station['id'] not in self.metadata['stations']:
-                    self.metadata['stations'][station['id']] = {
-                        'name': station['name'],
-                        'type': station['type'],
-                        'district': district,
-                        'downloads': {
-                            'successful': 0,
-                            'failed': 0
-                        }
-                    }
-
-                self.metadata['stations'][station['id']]['downloads']['successful'] += 1
                 self.metadata['download_stats']['successful_downloads'] += 1
-
-                self.logger.info(f"Successfully downloaded data for station {station['id']} "
-                                 f"on {date_str}")
+                self.logger.info(f"Successfully downloaded {station['name']}")
                 return True
 
             else:
-                if station['id'] in self.metadata['stations']:
-                    self.metadata['stations'][station['id']]['downloads']['failed'] += 1
                 self.metadata['download_stats']['failed_downloads'] += 1
-                self.logger.error(f"Failed to download data for station {station['id']} "
-                                  f"on {date_str}. Status: {response.status_code}")
+                self.logger.error(f"Failed to download {station['name']}. Status: {response.status_code}")
                 return False
 
         except Exception as e:
-            self.logger.error(f"Error downloading station {station['id']} data: {str(e)}")
+            self.logger.error(f"Error downloading station data: {str(e)}")
             return False
 
     def save_metadata(self):
