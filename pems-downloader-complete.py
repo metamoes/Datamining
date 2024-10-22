@@ -106,62 +106,87 @@ class PeMSDownloader:
             (self.output_dir / dir_name).mkdir(parents=True, exist_ok=True)
 
     def login(self) -> bool:
-        """Login to PeMS website with improved error handling"""
+        """Login to PeMS website matching the exact form structure"""
         try:
-            # First get the login page to capture any necessary cookies or tokens
-            login_page_url = f"{self.base_url}/"
-            login_page = self.session.get(login_page_url, verify=False)
-            if login_page.status_code != 200:
-                self.logger.error(f"Failed to access login page. Status code: {login_page.status_code}")
+            # First get the main page to establish session and get any cookies
+            main_url = "https://pems.dot.ca.gov"
+
+            self.logger.info("Accessing main page...")
+            main_response = self.session.get(main_url, verify=False)
+            if main_response.status_code != 200:
+                self.logger.error(f"Failed to access main page. Status: {main_response.status_code}")
                 return False
 
-            # Prepare login data
-            login_url = f"{self.base_url}/index.php"
-            payload = {
-                'action': 'login',
+            # The login form submits to the root URL with POST
+            login_url = "https://pems.dot.ca.gov/"
+
+            # Exactly match the form data from the HTML
+            login_payload = {
+                'redirect': '',  # Hidden input field
                 'username': self.username,
                 'password': self.password,
-                'redirect': '',
-                'login': 'Login'
+                'login': 'Login'  # Submit button value
             }
 
-            # Add additional headers for login request
             headers = {
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'Origin': self.base_url,
-                'Referer': f"{self.base_url}/"
+                'Origin': 'https://pems.dot.ca.gov',
+                'Referer': 'https://pems.dot.ca.gov/',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Cache-Control': 'max-age=0',
+                'Connection': 'keep-alive',
+                'Host': 'pems.dot.ca.gov',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'same-origin',
+                'Sec-Fetch-User': '?1',
+                'Upgrade-Insecure-Requests': '1',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36'
             }
 
-            # Attempt login
-            response = self.session.post(login_url, data=payload, headers=headers, verify=False)
-            
-            # Debug logging
-            self.logger.info(f"Login response status code: {response.status_code}")
-            
-            # Check if login was successful by making a test request to a protected page
-            test_url = f"{self.base_url}/clearinghouse"
+            self.logger.info(f"Attempting login with URL: {login_url}")
+            login_response = self.session.post(
+                login_url,
+                data=login_payload,
+                headers=headers,
+                verify=False,
+                allow_redirects=True
+            )
+
+            self.logger.info(f"Login response status: {login_response.status_code}")
+            self.logger.info(f"Login response URL: {login_response.url}")
+
+            # Check cookies
+            self.logger.info("Current cookies:")
+            for cookie in self.session.cookies:
+                self.logger.info(f"Cookie {cookie.name}: {cookie.value}")
+
+            # Verify login by checking a profile or clearinghouse page
+            test_url = "https://pems.dot.ca.gov/?dnode=profile"
+            self.logger.info(f"Testing authentication with URL: {test_url}")
+
             test_response = self.session.get(test_url, verify=False)
-            
-            if test_response.status_code == 200 and 'logout' in test_response.text.lower():
-                self.logger.info("Successfully logged in to PeMS")
-                return True
-            else:
-                self.logger.error("Failed to verify login - protected page test failed")
-                self.logger.debug(f"Test response content: {test_response.text[:500]}...")
+            self.logger.info(f"Test response status: {test_response.status_code}")
+            self.logger.info(f"Test response URL: {test_response.url}")
+
+            # If we're redirected back to the login page, login failed
+            if 'login' in test_response.url.lower():
+                self.logger.error("Login failed - redirected back to login page")
                 return False
 
-        except requests.exceptions.ConnectionError as e:
-            self.logger.error(f"Connection error during login: {str(e)}")
+            # If we see profile or clearinghouse content, login succeeded
+            if test_response.status_code == 200:
+                self.logger.info("Successfully logged in to PeMS")
+                return True
+
+            self.logger.error("Login verification failed")
             return False
-        except requests.exceptions.Timeout as e:
-            self.logger.error(f"Timeout during login: {str(e)}")
-            return False
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Request error during login: {str(e)}")
-            return False
+
         except Exception as e:
-            self.logger.error(f"Unexpected error during login: {str(e)}")
+            self.logger.error(f"Login error: {str(e)}")
+            self.logger.error(f"Full error details: {str(e.__class__.__name__)}: {str(e)}")
             return False
+
 
     def get_enabled_districts(self) -> List[str]:
         """Get list of enabled districts from config"""
@@ -212,31 +237,33 @@ class PeMSDownloader:
         try:
             # Format date for URL
             date_str = current_date.strftime("%Y%m%d")
-            
-            # Build download URL
-            download_url = (f"{self.base_url}/clearinghouse/downloads/station/"
-                          f"submit.php?district_id={district}&station_id={station['id']}"
-                          f"&date={date_str}&type=raw")
-            
+
+            # Updated clearinghouse URL structure
+            download_url = (f"https://pems.dot.ca.gov/clearinghouse/station_data/"
+                            f"download/{district}/{station['id']}/{date_str}")
+
             # Create output path
-            output_path = (self.output_dir / 'raw_data' / district / 
-                         station['id'] / f"{date_str}.txt.gz")
+            output_path = (self.output_dir / 'raw_data' / district /
+                           station['id'] / f"{date_str}.txt.gz")
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
+            self.logger.info(f"Attempting download from: {download_url}")
+
             # Download file
             response = self.session.get(download_url, stream=True, verify=False)
+
             if response.status_code == 200 and len(response.content) > 100:  # Basic size check
                 with open(output_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-                
+
                 # Update metadata
                 if district not in self.metadata['districts']:
                     self.metadata['districts'][district] = {
                         'total_stations': 0,
                         'processed_stations': 0
                     }
-                
+
                 if station['id'] not in self.metadata['stations']:
                     self.metadata['stations'][station['id']] = {
                         'name': station['name'],
@@ -247,22 +274,22 @@ class PeMSDownloader:
                             'failed': 0
                         }
                     }
-                
+
                 self.metadata['stations'][station['id']]['downloads']['successful'] += 1
                 self.metadata['download_stats']['successful_downloads'] += 1
-                
+
                 self.logger.info(f"Successfully downloaded data for station {station['id']} "
-                               f"on {date_str}")
+                                 f"on {date_str}")
                 return True
-            
+
             else:
                 if station['id'] in self.metadata['stations']:
                     self.metadata['stations'][station['id']]['downloads']['failed'] += 1
                 self.metadata['download_stats']['failed_downloads'] += 1
                 self.logger.error(f"Failed to download data for station {station['id']} "
-                                f"on {date_str}")
+                                  f"on {date_str}. Status: {response.status_code}")
                 return False
-                
+
         except Exception as e:
             self.logger.error(f"Error downloading station {station['id']} data: {str(e)}")
             return False
