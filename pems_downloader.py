@@ -1,14 +1,12 @@
 import re
-import pandas as pd
 import time
 from datetime import datetime
-import os
 from pathlib import Path
 import logging
 import sys
 import json
 import configparser
-from typing import List, Dict, Optional
+from typing import List, Optional
 import urllib3
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -16,9 +14,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import (
-    TimeoutException,
-    StaleElementReferenceException,
-    WebDriverException,
     NoSuchElementException
 )
 import requests
