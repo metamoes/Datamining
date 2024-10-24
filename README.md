@@ -33,8 +33,7 @@ An automated tool for downloading traffic data from California's Performance Mea
 
 ## Single-line Installation Command
 ```bash
-pip install torch numpy pandas scikit-learn matplotlib seaborn tqdm rich pyyaml configparser logging pathlib datetime typing tensorboard optuna pytest black pylint mypy
-```
+pip install torch numpy pandas scikit-learn matplotlib seaborn tqdm rich pyyaml configparser logging pathlib datetime typing tensorboard optuna pytest black pylint mypy selenium requests urllib3 webdriver-manager configparser```
 
 ## Configuration
 
