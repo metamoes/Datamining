@@ -25,18 +25,15 @@ An automated tool for downloading traffic data from California's Performance Mea
 
 ## Prerequisites
 
-- Python 3.7+
+- Python 3.7 - 3.11.9
 - Chrome browser installed
 - Valid PeMS account credentials
 
-## Required Python Packages
+# Installation Guide
 
+## Single-line Installation Command
 ```bash
-pip install selenium
-pip install requests
-pip install urllib3
-pip install webdriver-manager
-pip install configparser
+pip install torch numpy pandas scikit-learn matplotlib seaborn tqdm rich pyyaml configparser logging pathlib datetime typing tensorboard optuna pytest black pylint mypy
 ```
 
 ## Configuration
