@@ -1,230 +1,233 @@
-import os
-import glob
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import MinMaxScaler
+import os
+import glob
 from datetime import datetime
 import configparser
-import tqdm
+from tqdm import tqdm
 import logging
-from pathlib import Path
+import json
 
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler()
+    ]
 )
 
-class Config:
-    def __init__(self, config_file='config.ini'):
-        self.config = configparser.ConfigParser()
-        
-        # Default configurations
-        self.config['DATA'] = {
-            'data_path': 'E:/Dataset/pems_data/raw_data',
-            'sample_data_path': 'sample_data',
-            'sequence_length': '12',
-            'prediction_horizon': '6',
-            'batch_size': '32'
-        }
-        
-        self.config['MODEL'] = {
-            'hidden_size': '64',
-            'num_layers': '2',
-            'dropout': '0.2',
-            'learning_rate': '0.001',
-            'epochs': '100'
-        }
-        
-        # Load existing config if it exists
-        if os.path.exists(config_file):
-            self.config.read(config_file)
-        else:
-            with open(config_file, 'w') as f:
-                self.config.write(f)
-    
-    def get(self, section, key):
-        return self.config[section][key]
-
-class PEMSDataset(Dataset):
+class TrafficDataset(Dataset):
     def __init__(self, data_path, sequence_length=12):
         self.sequence_length = sequence_length
-        self.data = self._load_and_preprocess_data(data_path)
-        self.scaler = MinMaxScaler()
-        self.data_scaled = self.scaler.fit_transform(self.data)
+        self.features = []
+        self.targets = []
         
-    def _load_and_preprocess_data(self, data_path):
-        all_files = glob.glob(os.path.join(data_path, "district_*/*.txt"))
-        dfs = []
-        
-        for file in tqdm.tqdm(all_files, desc="Loading data files"):
-            df = self._process_single_file(file)
-            if df is not None:
-                dfs.append(df)
-        
-        return pd.concat(dfs, axis=0)
-    
-    def _process_single_file(self, file_path):
-        try:
-            # Read the raw data
-            df = pd.read_csv(file_path, header=None)
+        # Process all files in directory
+        for file_path in glob.glob(os.path.join(data_path, "*.txt")):
+            self._process_file(file_path)
             
-            # Extract timestamp and traffic metrics
-            df[0] = pd.to_datetime(df[0])
+    def _process_file(self, file_path):
+        df = pd.read_csv(file_path, header=None)
+        # Extract relevant features (flow, speed, occupancy)
+        # Assuming standard PeMS format
+        features = []
+        for row in df.values:
+            # Parse timestamp
+            timestamp = datetime.strptime(row[0], '%m/%d/%Y %H:%M:%S')
+            # Extract flow, speed, occupancy for each lane
+            lane_data = []
+            for i in range(6, len(row), 5):  # Each lane has 5 values
+                if pd.notna(row[i]) and pd.notna(row[i+1]) and pd.notna(row[i+2]):
+                    lane_data.extend([float(row[i]), float(row[i+1]), float(row[i+2])])
             
-            # Extract relevant columns (flow, speed, occupancy for each lane)
-            # Assuming columns follow the pattern described in the sample data
-            traffic_cols = []
-            for lane in range(8):  # Up to 8 lanes
-                base_idx = 6 + lane * 5  # Starting index for each lane's metrics
-                if base_idx + 3 < len(df.columns):
-                    traffic_cols.extend([base_idx, base_idx + 1, base_idx + 2])
-            
-            return df[traffic_cols]
+            if lane_data:  # Only add if we have valid data
+                features.append(lane_data)
         
-        except Exception as e:
-            logging.error(f"Error processing file {file_path}: {str(e)}")
-            return None
-    
-    def __len__(self):
-        return len(self.data_scaled) - self.sequence_length
-    
-    def __getitem__(self, idx):
-        sequence = self.data_scaled[idx:idx + self.sequence_length]
-        target = self.data_scaled[idx + self.sequence_length]
-        return torch.FloatTensor(sequence), torch.FloatTensor(target)
+        # Create sequences
+        for i in range(len(features) - self.sequence_length):
+            self.features.append(features[i:i+self.sequence_length])
+            self.targets.append(features[i+self.sequence_length])
 
-class TrafficLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, dropout=0.2):
-        super(TrafficLSTM, self).__init__()
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return torch.FloatTensor(self.features[idx]), torch.FloatTensor(self.targets[idx])
+
+class TrafficPredictor(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers):
+        super(TrafficPredictor, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, input_size)
         
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        self.linear = nn.Linear(hidden_size, input_size)
-    
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
-        predictions = self.linear(lstm_out[:, -1, :])
+        predictions = self.fc(lstm_out[:, -1, :])
         return predictions
 
-class TrafficPredictor:
+class ModelTrainer:
     def __init__(self, config_path='config.ini'):
-        self.config = Config(config_path)
+        self.config = self._load_config(config_path)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.setup_model()
+        self.models = {}
+        self.optimizers = {}
+        self.schedulers = {}
         
-    def setup_model(self):
-        # Create data loaders
-        self.dataset = PEMSDataset(
-            self.config.get('DATA', 'data_path'),
-            int(self.config.get('DATA', 'sequence_length'))
-        )
-        
-        train_size = int(0.8 * len(self.dataset))
-        test_size = len(self.dataset) - train_size
-        
-        self.train_dataset, self.test_dataset = torch.utils.data.random_split(
-            self.dataset, [train_size, test_size]
-        )
-        
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=int(self.config.get('DATA', 'batch_size')),
-            shuffle=True
-        )
-        
-        self.test_loader = DataLoader(
-            self.test_dataset,
-            batch_size=int(self.config.get('DATA', 'batch_size')),
-            shuffle=False
-        )
-        
-        # Create model
-        input_size = self.dataset.data.shape[1]
-        self.model = TrafficLSTM(
-            input_size=input_size,
-            hidden_size=int(self.config.get('MODEL', 'hidden_size')),
-            num_layers=int(self.config.get('MODEL', 'num_layers')),
-            dropout=float(self.config.get('MODEL', 'dropout'))
+    def _load_config(self, config_path):
+        config = configparser.ConfigParser()
+        config.read(config_path)
+        return config
+
+    def _init_model(self, district):
+        model = TrafficPredictor(
+            input_size=int(self.config['MODEL']['input_size']),
+            hidden_size=int(self.config['MODEL']['hidden_size']),
+            num_layers=int(self.config['MODEL']['num_layers'])
         ).to(self.device)
         
-        self.criterion = nn.MSELoss()
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
-            lr=float(self.config.get('MODEL', 'learning_rate'))
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=float(self.config['TRAINING']['learning_rate'])
         )
-    
-    def train(self):
-        epochs = int(self.config.get('MODEL', 'epochs'))
-        best_loss = float('inf')
         
-        for epoch in range(epochs):
-            self.model.train()
-            train_loss = 0
-            progress_bar = tqdm.tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{epochs}')
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            patience=int(self.config['TRAINING']['scheduler_patience'])
+        )
+        
+        return model, optimizer, scheduler
+
+    def save_checkpoint(self, district, epoch, model, optimizer, scheduler, loss):
+        checkpoint_path = os.path.join(
+            self.config['PATHS']['checkpoint_dir'],
+            f'model_{district}_checkpoint.pt'
+        )
+        
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'loss': loss
+        }, checkpoint_path)
+
+    def load_checkpoint(self, district):
+        checkpoint_path = os.path.join(
+            self.config['PATHS']['checkpoint_dir'],
+            f'model_{district}_checkpoint.pt'
+        )
+        
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path)
+            model, optimizer, scheduler = self._init_model(district)
             
-            for batch_idx, (sequences, targets) in enumerate(progress_bar):
-                sequences = sequences.to(self.device)
-                targets = targets.to(self.device)
-                
-                self.optimizer.zero_grad()
-                outputs = self.model(sequences)
-                loss = self.criterion(outputs, targets)
-                loss.backward()
-                self.optimizer.step()
-                
-                train_loss += loss.item()
-                progress_bar.set_postfix({'loss': train_loss/(batch_idx+1)})
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             
+            return model, optimizer, scheduler, checkpoint['epoch']
+        
+        return None
+
+    def train_district(self, district, train_loader, val_loader=None):
+        logging.info(f"Training model for district {district}")
+        
+        # Check for existing checkpoint
+        checkpoint_data = self.load_checkpoint(district)
+        if checkpoint_data:
+            model, optimizer, scheduler, start_epoch = checkpoint_data
+            logging.info(f"Resuming training from epoch {start_epoch}")
+        else:
+            model, optimizer, scheduler = self._init_model(district)
+            start_epoch = 0
+
+        criterion = nn.MSELoss()
+        num_epochs = int(self.config['TRAINING']['num_epochs'])
+        
+        for epoch in range(start_epoch, num_epochs):
+            model.train()
+            total_loss = 0
+            
+            with tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}") as pbar:
+                for batch_features, batch_targets in pbar:
+                    batch_features = batch_features.to(self.device)
+                    batch_targets = batch_targets.to(self.device)
+                    
+                    optimizer.zero_grad()
+                    outputs = model(batch_features)
+                    loss = criterion(outputs, batch_targets)
+                    loss.backward()
+                    optimizer.step()
+                    
+                    total_loss += loss.item()
+                    pbar.set_postfix({'loss': total_loss/len(train_loader)})
+
             # Validation
-            val_loss = self.evaluate()
-            logging.info(f'Epoch {epoch+1}/{epochs} - Train Loss: {train_loss/len(self.train_loader):.4f} - Val Loss: {val_loss:.4f}')
+            if val_loader:
+                val_loss = self.validate(model, val_loader, criterion)
+                scheduler.step(val_loss)
+                
+            # Save checkpoint
+            self.save_checkpoint(district, epoch + 1, model, optimizer, scheduler, total_loss/len(train_loader))
             
-            # Save checkpoint if best model
-            if val_loss < best_loss:
-                best_loss = val_loss
-                self.save_checkpoint('best_model.pth')
-    
-    def evaluate(self):
-        self.model.eval()
+        return model
+
+    def validate(self, model, val_loader, criterion):
+        model.eval()
         total_loss = 0
         
         with torch.no_grad():
-            for sequences, targets in self.test_loader:
-                sequences = sequences.to(self.device)
-                targets = targets.to(self.device)
-                outputs = self.model(sequences)
-                loss = self.criterion(outputs, targets)
+            for batch_features, batch_targets in val_loader:
+                batch_features = batch_features.to(self.device)
+                batch_targets = batch_targets.to(self.device)
+                
+                outputs = model(batch_features)
+                loss = criterion(outputs, batch_targets)
                 total_loss += loss.item()
-        
-        return total_loss / len(self.test_loader)
-    
-    def save_checkpoint(self, filename):
-        checkpoint = {
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scaler': self.dataset.scaler
-        }
-        torch.save(checkpoint, filename)
-    
-    def load_checkpoint(self, filename):
-        checkpoint = torch.load(filename)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.dataset.scaler = checkpoint['scaler']
+                
+        return total_loss / len(val_loader)
 
-def main():
-    predictor = TrafficPredictor()
-    predictor.train()
+    def train_all_districts(self):
+        base_path = self.config['PATHS']['data_dir']
+        districts = [d for d in os.listdir(base_path) if d.startswith('district_')]
+        
+        for district in districts:
+            district_path = os.path.join(base_path, district)
+            dataset = TrafficDataset(district_path)
+            
+            # Split dataset
+            train_size = int(0.8 * len(dataset))
+            val_size = len(dataset) - train_size
+            train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+            
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=int(self.config['TRAINING']['batch_size']),
+                shuffle=True
+            )
+            
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=int(self.config['TRAINING']['batch_size'])
+            )
+            
+            model = self.train_district(district, train_loader, val_loader)
+            self.models[district] = model
+
+        # Train combined model
+        self._train_combined_model()
+
+    def _train_combined_model(self):
+        # Implementation for combined model training
+        pass
 
 if __name__ == "__main__":
-    main()
+    trainer = ModelTrainer()
+    trainer.train_all_districts()
