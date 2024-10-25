@@ -1,0 +1,76 @@
+import torch
+import logging
+
+# Setup logging first
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler()
+    ]
+)
+
+
+# GPU Detection and Setup
+def setup_device():
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        logging.info(f"CUDA Version: {torch.version.cuda}")
+        logging.info(f"PyTorch CUDA available: {torch.cuda.is_available()}")
+        logging.info(f"Number of GPUs: {torch.cuda.device_count()}")
+        return device
+    else:
+        logging.warning("CUDA is not available. Check your PyTorch installation and NVIDIA drivers.")
+        logging.warning("Falling back to CPU (this will be much slower)")
+        return torch.device('cpu')
+
+
+# Rest of your imports
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import numpy as np
+import os
+import glob
+from datetime import datetime
+import configparser
+from tqdm import tqdm
+import json
+
+
+class ModelTrainer:
+    def __init__(self, config_path='config.ini'):
+        self.config = self._load_config(config_path)
+        self.device = setup_device()
+
+        # Create necessary directories
+        os.makedirs(self.config['PATHS']['checkpoint_dir'], exist_ok=True)
+        os.makedirs(self.config['PATHS']['model_dir'], exist_ok=True)
+
+        self.models = {}
+        self.optimizers = {}
+        self.schedulers = {}
+
+
+# [Rest of your code remains the same]
+
+if __name__ == "__main__":
+    # Print PyTorch version and CUDA information
+    logging.info(f"PyTorch Version: {torch.__version__}")
+
+    if torch.cuda.is_available():
+        # Enable CUDA optimizations
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    trainer = ModelTrainer()
+    try:
+        trainer.train_all_districts()
+    except KeyboardInterrupt:
+        logging.info("Training stopped by user")
+    except Exception as e:
+        logging.error(f"Error during training: {str(e)}")
