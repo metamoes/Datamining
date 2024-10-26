@@ -95,6 +95,53 @@ class Config:
             config.write(f)
 
 
+class TrafficPredictor(nn.Module):
+    """Neural network model for traffic prediction"""
+
+    def __init__(self, input_size=3, sequence_length=12, hidden_sizes=[64, 32], output_size=3, dropout_rate=0.2):
+        super().__init__()
+
+        self.sequence_length = sequence_length
+
+        # LSTM layer to process the sequence
+        self.lstm = nn.LSTM(
+            input_size=input_size,  # 3 features per time step
+            hidden_size=hidden_sizes[0],
+            num_layers=2,
+            dropout=dropout_rate,
+            batch_first=True
+        )
+
+        # Build fully connected layers for final prediction
+        layers = []
+        prev_size = hidden_sizes[0]
+
+        for hidden_size in hidden_sizes[1:]:
+            layers.extend([
+                nn.Linear(prev_size, hidden_size),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate)
+            ])
+            prev_size = hidden_size
+
+        # Output layer
+        layers.append(nn.Linear(prev_size, output_size))
+
+        self.fc_layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        # x shape: (batch_size, sequence_length, features)
+
+        # Process sequence with LSTM
+        lstm_out, _ = self.lstm(x)
+
+        # Take the last time step's output
+        lstm_last = lstm_out[:, -1, :]
+
+        # Final prediction
+        return self.fc_layers(lstm_last)
+
+
 class TrafficDataset(Dataset):
     """Dataset class for traffic data"""
 
@@ -107,42 +154,17 @@ class TrafficDataset(Dataset):
         district_path = Path(district_path)
         logging.info(f"Searching for data files in: {district_path}")
 
-        # Print all files in directory for debugging
-        logging.info("Directory contents:")
-        for item in district_path.glob('*'):
-            logging.info(f"Found: {item}")
-
-        # Try different file patterns
-        patterns = [
-            'd*_text_station_5min_*.txt',
-            'district_*_*.txt',
-            '*.txt'
-        ]
-
-        data_files = []
-        for pattern in patterns:
-            files = list(district_path.glob(pattern))
-            if files:
-                logging.info(f"Found {len(files)} files with pattern: {pattern}")
-                data_files.extend(files)
-                break
+        data_files = list(district_path.glob('d03_text_station_5min_*.txt'))
 
         if not data_files:
-            logging.error(f"No data files found in {district_path} with any pattern")
+            logging.error(f"No data files found in {district_path}")
             raise FileNotFoundError(f"No data files found in {district_path}")
 
-        logging.info(f"Found {len(data_files)} total data files")
+        logging.info(f"Found {len(data_files)} data files")
 
         all_data = []
         for file_path in tqdm(data_files, desc="Loading data files"):
             try:
-                # Try to read the first few lines of the file for debugging
-                with open(file_path, 'r') as f:
-                    first_lines = [next(f) for _ in range(5)]
-                logging.info(f"First few lines of {file_path.name}:")
-                for line in first_lines:
-                    logging.info(line.strip())
-
                 # Read the file
                 df = pd.read_csv(file_path, header=None)
 
@@ -182,39 +204,11 @@ class TrafficDataset(Dataset):
         return len(self.data) - self.sequence_length
 
     def __getitem__(self, idx):
+        # Get sequence of data points
         sequence = self.data[idx:idx + self.sequence_length]
+        # Get the next point as target
         target = self.data[idx + self.sequence_length]
         return sequence, target
-
-class TrafficPredictor(nn.Module):
-    """Neural network model for traffic prediction"""
-
-    def __init__(self, input_size, hidden_sizes, output_size, dropout_rate=0.2):
-        super().__init__()
-
-        # Convert hidden_sizes string to list of integers
-        if isinstance(hidden_sizes, str):
-            hidden_sizes = [int(size) for size in hidden_sizes.split(',')]
-
-        layers = []
-        prev_size = input_size
-
-        # Build hidden layers
-        for hidden_size in hidden_sizes:
-            layers.extend([
-                nn.Linear(prev_size, hidden_size),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate)
-            ])
-            prev_size = hidden_size
-
-        # Output layer
-        layers.append(nn.Linear(prev_size, output_size))
-
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.model(x)
 
 
 class TrainingManager:
@@ -227,53 +221,21 @@ class TrainingManager:
         self.checkpoint_dir = Path(config.config['PATHS']['checkpoint_dir'])
         self.checkpoint_dir.mkdir(exist_ok=True)
 
-        # Verify CUDA device
-        if self.device.type == 'cuda':
-            gpu_name = torch.cuda.get_device_name(0)
-            if '2080' not in gpu_name:
-                logging.warning(f"Expected RTX 2080 Super, found: {gpu_name}")
-        else:
-            logging.warning("CUDA device not available, using CPU")
-
-    def save_checkpoint(self, model, optimizer, epoch, loss):
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': loss,
-        }
-        path = self.checkpoint_dir / f'district_{self.district}_checkpoint_{epoch}.pt'
-        torch.save(checkpoint, path)
-
-    def load_checkpoint(self, model, optimizer, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        return checkpoint['epoch'], checkpoint['loss']
-
     def train_model(self, model, train_loader):
         model = model.to(self.device)
         criterion = nn.MSELoss()
         optimizer = optim.Adam(model.parameters(), lr=float(self.config.config['TRAINING']['learning_rate']))
 
-        # Load latest checkpoint if exists
-        start_epoch = 0
-        checkpoint_files = list(self.checkpoint_dir.glob(f'district_{self.district}_checkpoint_*.pt'))
-        if checkpoint_files:
-            latest_checkpoint = max(checkpoint_files, key=lambda x: int(x.stem.split('_')[-1]))
-            start_epoch, _ = self.load_checkpoint(model, optimizer, latest_checkpoint)
-            logging.info(f"Resuming training from epoch {start_epoch}")
-
         epochs = int(self.config.config['TRAINING']['epochs'])
-        checkpoint_freq = int(self.config.config['TRAINING']['checkpoint_frequency'])
 
-        for epoch in range(start_epoch, epochs):
+        for epoch in range(epochs):
             model.train()
             total_loss = 0
             progress_bar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs}')
 
             for batch_idx, (sequences, targets) in enumerate(progress_bar):
-                sequences, targets = sequences.to(self.device), targets.to(self.device)
+                sequences = sequences.to(self.device)
+                targets = targets.to(self.device)
 
                 optimizer.zero_grad()
                 outputs = model(sequences)
@@ -287,8 +249,15 @@ class TrainingManager:
             avg_loss = total_loss / len(train_loader)
             logging.info(f'Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}')
 
-            if (epoch + 1) % checkpoint_freq == 0:
-                self.save_checkpoint(model, optimizer, epoch + 1, avg_loss)
+            # Save checkpoint
+            if (epoch + 1) % int(self.config.config['TRAINING']['checkpoint_frequency']) == 0:
+                checkpoint = {
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg_loss,
+                }
+                torch.save(checkpoint, self.checkpoint_dir / f'district_{self.district}_checkpoint_{epoch + 1}.pt')
 
 
 def main():
@@ -296,19 +265,10 @@ def main():
         # Initialize configuration
         config = Config()
 
-        # Verify paths
-        base_path = verify_paths(config)
-
-        # Create model directories
+        # Verify paths and create directories
+        base_path = Path(config.config['PATHS']['data_dir'])
         model_dir = Path(config.config['PATHS']['model_dir'])
         model_dir.mkdir(exist_ok=True)
-
-        # Initialize CUDA device
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        if device.type == 'cuda':
-            logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        else:
-            logging.warning("CUDA device not available, using CPU")
 
         # Process district 3
         district = 3
@@ -319,37 +279,33 @@ def main():
             return
 
         logging.info(f"Processing District {district}")
-        logging.info(f"Looking for data in: {district_path}")
 
-        # Create dataset
-        try:
-            dataset = TrafficDataset(district_path)
-            dataloader = DataLoader(
-                dataset,
-                batch_size=int(config.config['TRAINING']['batch_size']),
-                shuffle=True,
-                num_workers=0
-            )
+        # Create dataset and dataloader
+        dataset = TrafficDataset(district_path)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=32,  # Smaller batch size to start
+            shuffle=True,
+            num_workers=0
+        )
 
-            logging.info(f"Successfully created dataset with {len(dataset)} samples")
+        logging.info(f"Created dataset with {len(dataset)} samples")
 
-            # Initialize and train model
-            model = TrafficPredictor(
-                input_size=int(config.config['MODEL']['input_size']),
-                hidden_sizes=config.config['MODEL']['hidden_layers'],
-                output_size=int(config.config['MODEL']['output_size']),
-                dropout_rate=float(config.config['MODEL']['dropout'])
-            ).to(device)
+        # Initialize model with correct dimensions
+        model = TrafficPredictor(
+            input_size=3,  # Three features per time step
+            sequence_length=12,
+            hidden_sizes=[64, 32],
+            output_size=3,
+            dropout_rate=0.2
+        )
 
-            trainer = TrainingManager(config, district)
-            trainer.train_model(model, dataloader)
+        # Train model
+        trainer = TrainingManager(config, district)
+        trainer.train_model(model, dataloader)
 
-            # Save the model
-            torch.save(model.state_dict(), model_dir / f'district_{district}_model.pt')
-
-        except Exception as e:
-            logging.error(f"Error processing district {district}: {str(e)}")
-            logging.error(traceback.format_exc())
+        # Save final model
+        torch.save(model.state_dict(), model_dir / f'district_{district}_model.pt')
 
     except Exception as e:
         logging.error(f"Fatal error: {str(e)}")
