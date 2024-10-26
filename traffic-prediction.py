@@ -1,4 +1,5 @@
 import configparser
+import inspect
 import logging
 import os
 import queue
@@ -11,7 +12,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -223,51 +223,66 @@ class DataPreprocessor:
 
         return tensor_data
 
-class TrafficPredictor(nn.Module):
-    """Neural network model for traffic prediction"""
 
-    def __init__(self, input_size=3, sequence_length=12, hidden_sizes=[64, 32], output_size=3, dropout_rate=0.2):
+class TrafficPredictor(nn.Module):
+    """Enhanced neural network model for traffic prediction"""
+
+    def __init__(self, input_size=3, sequence_length=12, hidden_sizes=[128, 64], output_size=3, dropout_rate=0.2):
         super().__init__()
 
         self.sequence_length = sequence_length
 
-        # LSTM layer to process the sequence
+        # Bidirectional LSTM for better sequence processing
         self.lstm = nn.LSTM(
-            input_size=input_size,  # 3 features per time step
+            input_size=input_size,
             hidden_size=hidden_sizes[0],
             num_layers=2,
+            dropout=dropout_rate,
+            batch_first=True,
+            bidirectional=True  # Enable bidirectional processing
+        )
+
+        # Attention mechanism
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_sizes[0] * 2,  # *2 for bidirectional
+            num_heads=4,
             dropout=dropout_rate,
             batch_first=True
         )
 
-        # Build fully connected layers for final prediction
+        # Enhanced fully connected layers with residual connections
         layers = []
-        prev_size = hidden_sizes[0]
+        prev_size = hidden_sizes[0] * 2  # *2 for bidirectional
 
         for hidden_size in hidden_sizes[1:]:
             layers.extend([
+                nn.LayerNorm(prev_size),  # Add layer normalization
                 nn.Linear(prev_size, hidden_size),
-                nn.ReLU(),
+                nn.GELU(),  # Use GELU activation
                 nn.Dropout(dropout_rate)
             ])
             prev_size = hidden_size
 
-        # Output layer
-        layers.append(nn.Linear(prev_size, output_size))
+        # Output layer with layer normalization
+        layers.extend([
+            nn.LayerNorm(prev_size),
+            nn.Linear(prev_size, output_size)
+        ])
 
         self.fc_layers = nn.Sequential(*layers)
 
     def forward(self, x):
-        # x shape: (batch_size, sequence_length, features)
-
         # Process sequence with LSTM
         lstm_out, _ = self.lstm(x)
 
-        # Take the last time step's output
-        lstm_last = lstm_out[:, -1, :]
+        # Apply attention mechanism
+        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
+
+        # Global average pooling with residual connection
+        pooled = torch.mean(attn_out + lstm_out, dim=1)
 
         # Final prediction
-        return self.fc_layers(lstm_last)
+        return self.fc_layers(pooled)
 
 
 class TrafficDataset(Dataset):
@@ -335,57 +350,8 @@ class PrefetchDataLoader:
         return batch
 
 
-class TrafficPredictor(nn.Module):
-    """Neural network model with enhanced performance"""
-
-    def __init__(self, input_size=3, sequence_length=12, hidden_sizes=[64, 32], output_size=3, dropout_rate=0.2):
-        super().__init__()
-
-        self.sequence_length = sequence_length
-
-        # Use faster LSTM implementation
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_sizes[0],
-            num_layers=2,
-            dropout=dropout_rate,
-            batch_first=True,
-            bias=True
-        )
-
-        # Optimize fully connected layers
-        layers = []
-        prev_size = hidden_sizes[0]
-
-        for hidden_size in hidden_sizes[1:]:
-            layers.extend([
-                nn.Linear(prev_size, hidden_size, bias=True),
-                nn.ReLU(inplace=True),  # Use inplace operations
-                nn.Dropout(dropout_rate)
-            ])
-            prev_size = hidden_size
-
-        layers.append(nn.Linear(prev_size, output_size))
-        self.fc_layers = nn.Sequential(*layers)
-
-        # Initialize weights for faster convergence
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                nn.init.xavier_uniform_(param)
-            elif 'bias' in name:
-                nn.init.zeros_(param)
-
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        lstm_last = lstm_out[:, -1, :]
-        return self.fc_layers(lstm_last)
-
-
 class TrainingManager:
-    """Highly optimized training manager with CUDA optimizations, memory efficiency, and ETA tracking"""
+    """Highly optimized training manager with validation support"""
 
     def __init__(self, config, district):
         self.config = config
@@ -394,195 +360,65 @@ class TrainingManager:
         self.checkpoint_dir = Path(config.config['PATHS']['checkpoint_dir'])
         self.checkpoint_dir.mkdir(exist_ok=True)
 
-        # Enable CUDA optimizations
+        # Performance optimizations
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.allow_tf32 = True
 
+        # Use lower precision for better speed
         self.scaler = torch.amp.GradScaler(
-            init_scale=2 ** 16,
-            growth_factor=2,
+            init_scale=2 ** 10,
+            growth_factor=1.5,
             backoff_factor=0.5,
-            growth_interval=2000
+            growth_interval=100
         )
 
-        torch.cuda.empty_cache()
-        torch.cuda.memory.empty_cache()
+        # Pre-allocate tensors for stats
+        self.loss_tensor = torch.zeros(1, device=self.device)
+        self.stats_cache = {}
 
-        logging.info(f"Initialized TrainingManager with optimizations:")
-        logging.info(f"  - Device: {self.device}")
-        logging.info(f"  - Checkpoint directory: {self.checkpoint_dir}")
-        logging.info(f"  - CUDA memory allocated: {torch.cuda.memory_allocated() / 1024 ** 2:.2f} MB")
-        logging.info(f"  - CUDA memory cached: {torch.cuda.memory_reserved() / 1024 ** 2:.2f} MB")
+        # Initialize logging
+        self.log_buffer = []
+        self.log_interval = 50
+        self.flush_interval = 1000
+        self.last_log_time = time.time()
 
     def _format_time(self, seconds):
-        """Format time in human readable format"""
+        """Format time in a human-readable way"""
         if seconds < 60:
             return f"{seconds:.0f}s"
         elif seconds < 3600:
-            minutes = seconds / 60
-            return f"{minutes:.1f}m"
+            return f"{seconds / 60:.1f}m"
         else:
-            hours = seconds / 3600
-            return f"{hours:.1f}h"
+            return f"{seconds / 3600:.1f}h"
 
-    def train_model(self, model, train_loader):
-        model = model.to(self.device)
-        model.train()
-
-        if torch.cuda.get_device_capability()[0] >= 7:
-            logging.info("Tensor cores enabled for compatible operations")
-
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logging.info(f"Model architecture:")
-        logging.info(f"  - Total parameters: {total_params:,}")
-        logging.info(f"  - Trainable parameters: {trainable_params:,}")
-
-        try:
-            model = torch.jit.script(model)
-        except Exception as e:
-            logging.warning(f"JIT compilation failed, using standard model: {str(e)}")
-
-        criterion = nn.MSELoss(reduction='mean')
-
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=float(self.config.config['TRAINING']['learning_rate']),
-            weight_decay=0.01,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            amsgrad=True
+    def _is_bad_batch(self, sequences, targets):
+        """Check for invalid batches"""
+        return (
+                torch.isnan(sequences).any() or
+                torch.isnan(targets).any() or
+                torch.isinf(sequences).any() or
+                torch.isinf(targets).any()
         )
 
-        # Calculate total iterations and expected time
-        epochs = int(self.config.config['TRAINING']['epochs'])
-        total_batches = len(train_loader)
-        total_iterations = epochs * total_batches
+    def _training_step(self, model, sequences, targets, optimizer, criterion):
+        """Execute one training step"""
+        optimizer.zero_grad(set_to_none=True)
 
-        logging.info(f"Training plan:")
-        logging.info(f"  - Total epochs: {epochs:,}")
-        logging.info(f"  - Batches per epoch: {total_batches:,}")
-        logging.info(f"  - Total iterations: {total_iterations:,}")
+        with torch.cuda.amp.autocast():
+            outputs = model(sequences)
+            loss = criterion(outputs, targets)
 
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=float(self.config.config['TRAINING']['learning_rate']),
-            total_steps=total_iterations,
-            pct_start=0.3,
-            anneal_strategy='cos',
-            cycle_momentum=True,
-            base_momentum=0.85,
-            max_momentum=0.95
-        )
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        self.scaler.step(optimizer)
+        self.scaler.update()
 
-        prefetch_loader = PrefetchDataLoader(train_loader, self.device, queue_size=3)
-        total_start_time = time.time()
-        best_loss = float('inf')
-        running_loss = 0.0
+        return loss
 
-        # Initialize timing trackers
-        iterations_complete = 0
-        moving_avg_time_per_batch = None
-        alpha = 0.1  # Smoothing factor for moving average
-
-        for epoch in range(epochs):
-            epoch_start_time = time.time()
-
-            progress_bar = tqdm(
-                prefetch_loader,
-                desc=f'Epoch {epoch + 1}/{epochs}',
-                dynamic_ncols=True
-            )
-
-            batch_times = []
-            for batch_idx, (sequences, targets) in enumerate(progress_bar):
-                batch_start = time.time()
-
-                # Training step
-                for param in model.parameters():
-                    param.grad = None
-
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    outputs = model(sequences)
-                    loss = criterion(outputs, targets)
-
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                self.scaler.step(optimizer)
-                self.scaler.update()
-                scheduler.step()
-
-                # Update tracking metrics
-                iterations_complete += 1
-                batch_time = time.time() - batch_start
-                batch_times.append(batch_time)
-
-                # Update moving average of time per batch
-                if moving_avg_time_per_batch is None:
-                    moving_avg_time_per_batch = batch_time
-                else:
-                    moving_avg_time_per_batch = (1 - alpha) * moving_avg_time_per_batch + alpha * batch_time
-
-                # Calculate ETA
-                iterations_remaining = total_iterations - iterations_complete
-                estimated_time_remaining = iterations_remaining * moving_avg_time_per_batch
-
-                # Calculate progress metrics
-                progress_percent = (iterations_complete / total_iterations) * 100
-                elapsed_time = time.time() - total_start_time
-
-                running_loss = 0.99 * running_loss + 0.01 * loss.item()
-
-                # Update progress bar with comprehensive metrics
-                if batch_idx % 10 == 0:
-                    current_lr = optimizer.param_groups[0]['lr']
-                    avg_batch_time = np.mean(batch_times[-100:]) if batch_times else 0
-                    progress_bar.set_postfix({
-                        'loss': f"{running_loss:.6f}",
-                        'lr': f"{current_lr:.6e}",
-                        'progress': f"{progress_percent:.1f}%",
-                        'it': f"{iterations_complete}/{total_iterations}",
-                        'batch': f"{avg_batch_time:.3f}s",
-                        'ETA': self._format_time(estimated_time_remaining),
-                        'elapsed': self._format_time(elapsed_time)
-                    })
-
-            epoch_time = time.time() - epoch_start_time
-
-            # Log detailed epoch statistics
-            logging.info(f"Epoch {epoch + 1} completed:")
-            logging.info(f"  - Loss: {running_loss:.6f}")
-            logging.info(f"  - Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
-            logging.info(f"  - Time: {self._format_time(epoch_time)}")
-            logging.info(f"  - Progress: {progress_percent:.1f}%")
-            logging.info(f"  - Iterations: {iterations_complete:,}/{total_iterations:,}")
-            logging.info(f"  - ETA: {self._format_time(estimated_time_remaining)}")
-            logging.info(f"  - CUDA memory: {torch.cuda.memory_allocated() / 1024 ** 2:.0f}MB")
-
-            if running_loss < best_loss:
-                best_loss = running_loss
-                torch.cuda.synchronize()
-                self._save_checkpoint(model, optimizer, epoch, running_loss)
-                logging.info(f"  - New best loss achieved!")
-
-            if (epoch + 1) % int(self.config.config['TRAINING']['checkpoint_frequency']) == 0:
-                self._save_checkpoint(model, optimizer, epoch, running_loss)
-
-            if (epoch + 1) % 5 == 0:
-                torch.cuda.empty_cache()
-
-        total_time = time.time() - total_start_time
-        logging.info(f"Training completed:")
-        logging.info(f"  - Total time: {self._format_time(total_time)}")
-        logging.info(f"  - Best loss: {best_loss:.6f}")
-        logging.info(f"  - Average time per iteration: {self._format_time(total_time / iterations_complete)}")
-        logging.info(f"  - Final CUDA memory: {torch.cuda.memory_allocated() / 1024 ** 2:.0f}MB")
-
-    def _save_checkpoint(self, model, optimizer, epoch, loss):
-        checkpoint_path = self.checkpoint_dir / f'district_{self.district}_checkpoint_{epoch + 1}.pt'
-
+    def _save_checkpoint_efficient(self, model, optimizer, epoch, loss):
+        """Save model checkpoint efficiently"""
         checkpoint = {
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
@@ -590,66 +426,188 @@ class TrainingManager:
             'loss': loss,
         }
 
-        try:
-            torch.save(
-                checkpoint,
-                checkpoint_path,
-                _use_new_zipfile_serialization=True,
+        checkpoint_path = self.checkpoint_dir / f'district_{self.district}_checkpoint_{epoch + 1}.pt'
+        torch.save(checkpoint, checkpoint_path, _use_new_zipfile_serialization=True)
+        logging.info(f"Saved checkpoint: {checkpoint_path}")
+
+    def train_model(self, model, train_loader, val_loader=None):
+        """Train the model with validation support"""
+        model = model.to(self.device)
+        model.train()
+
+        # Optimize model for training
+        if hasattr(model, 'fuse_model'):
+            model.fuse_model()
+
+        if torch.cuda.get_device_capability()[0] >= 7:
+            model = model.cuda().half()
+
+        criterion = nn.MSELoss(reduction='mean')
+
+        # Use fused Adam if available
+        use_fused = 'fused' in inspect.signature(optim.Adam).parameters
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=float(self.config.config['TRAINING']['learning_rate']),
+            weight_decay=0.001,
+            fused=use_fused
+        )
+
+        epochs = int(self.config.config['TRAINING']['epochs'])
+        best_val_loss = float('inf')
+        training_start = time.time()
+
+        for epoch in range(epochs):
+            # Training phase
+            model.train()
+            epoch_start = time.time()
+            train_progress = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs} [Train]')
+
+            train_loss = 0
+            num_batches = 0
+
+            for sequences, targets in train_progress:
+                sequences = sequences.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+
+                if self._is_bad_batch(sequences, targets):
+                    continue
+
+                loss = self._training_step(model, sequences, targets, optimizer, criterion)
+                train_loss += loss.item()
+                num_batches += 1
+
+                train_progress.set_postfix({'loss': f"{loss.item():.6f}"})
+
+            avg_train_loss = train_loss / num_batches if num_batches > 0 else float('inf')
+
+            # Validation phase
+            if val_loader is not None:
+                model.eval()
+                val_loss = 0
+                val_batches = 0
+                val_progress = tqdm(val_loader, desc=f'Epoch {epoch + 1}/{epochs} [Val]')
+
+                with torch.no_grad():
+                    for sequences, targets in val_progress:
+                        sequences = sequences.to(self.device, non_blocking=True)
+                        targets = targets.to(self.device, non_blocking=True)
+
+                        if self._is_bad_batch(sequences, targets):
+                            continue
+
+                        with torch.cuda.amp.autocast():
+                            outputs = model(sequences)
+                            loss = criterion(outputs, targets)
+
+                        val_loss += loss.item()
+                        val_batches += 1
+                        val_progress.set_postfix({'val_loss': f"{loss.item():.6f}"})
+
+                avg_val_loss = val_loss / val_batches if val_batches > 0 else float('inf')
+
+                # Save checkpoint if validation improves
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    self._save_checkpoint_efficient(model, optimizer, epoch, avg_val_loss)
+                    logging.info(f"New best validation loss: {avg_val_loss:.6f}")
+
+            epoch_time = time.time() - epoch_start
+            logging.info(
+                f"\nEpoch {epoch + 1}/{epochs} completed in {self._format_time(epoch_time)}"
+                f"\n  Training Loss: {avg_train_loss:.6f}"
+                + (f"\n  Validation Loss: {avg_val_loss:.6f}" if val_loader else "")
             )
-            checkpoint_size = checkpoint_path.stat().st_size / (1024 * 1024)
-            logging.info(f"Saved checkpoint {epoch + 1}:")
-            logging.info(f"  - Path: {checkpoint_path}")
-            logging.info(f"  - Size: {checkpoint_size:.2f} MB")
-            logging.info(f"  - Loss: {loss:.6f}")
-        except Exception as e:
-            logging.error(f"Failed to save checkpoint: {str(e)}")
+
+            # Clear memory periodically
+            if epoch % 2 == 0:
+                torch.cuda.empty_cache()
+
+        total_time = time.time() - training_start
+        logging.info(f"Training completed in {self._format_time(total_time)}")
+        logging.info(f"Best validation loss: {best_val_loss:.6f}")
 
 
 def main():
     try:
+        # Initialize config and paths
         config = Config()
         base_path = verify_paths(config)
         model_dir = Path(config.config['PATHS']['model_dir'])
         model_dir.mkdir(exist_ok=True)
 
+        # Set up district path
         district = 3
         district_path = base_path / f'district_{district}'
 
-        # Use enhanced data preprocessing to get tensor data
+        # Initialize preprocessor and get data
         preprocessor = DataPreprocessor(district_path)
         processed_data = preprocessor.preprocess_and_cache()
 
-        # Create dataset with the preprocessed tensor data
-        dataset = TrafficDataset(processed_data)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=128,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True
-        )
+        # Create dataset with proper train/val split
+        total_size = len(processed_data)
+        train_size = int(0.8 * total_size)
+        train_data = processed_data[:train_size]
+        val_data = processed_data[train_size:]
 
-        # Initialize model
+        train_dataset = TrafficDataset(train_data)
+        val_dataset = TrafficDataset(val_data)
+
+        # Optimized DataLoader configuration
+        dataloader_config = {
+            'batch_size': 512,  # Increased batch size
+            'num_workers': min(8, os.cpu_count()),
+            'pin_memory': True,
+            'persistent_workers': True,
+            'prefetch_factor': 2,
+            'drop_last': True
+        }
+
+        train_loader = DataLoader(train_dataset, shuffle=True, **dataloader_config)
+        val_loader = DataLoader(val_dataset, shuffle=False, **dataloader_config)
+
+        # Initialize enhanced model
         model = TrafficPredictor(
             input_size=3,
             sequence_length=12,
-            hidden_sizes=[64, 32],
+            hidden_sizes=[128, 64],  # Increased capacity
             output_size=3,
             dropout_rate=0.2
         )
 
-        # Train with enhanced manager
-        trainer = TrainingManager(config, district)
-        trainer.train_model(model, dataloader)
+        # Use model compilation if available
+        if hasattr(torch, 'compile'):
+            model = torch.compile(
+                model,
+                mode='max-autotune',
+                fullgraph=True
+            )
 
-        # Save final model
-        torch.save(model.state_dict(), model_dir / f'district_{district}_model.pt')
+        # Initialize trainer with validation support
+        trainer = TrainingManager(config, district)
+        trainer.train_model(model, train_loader, val_loader)
+
+        # Save final model with metadata
+        final_model_path = model_dir / f'district_{district}_model.pt'
+        metadata = {
+            'model_state': model.state_dict(),
+            'model_config': {
+                'input_size': 3,
+                'sequence_length': 12,
+                'hidden_sizes': [128, 64],
+                'output_size': 3,
+                'dropout_rate': 0.2
+            },
+            'training_config': dataloader_config,
+            'timestamp': time.strftime('%Y%m%d-%H%M%S')
+        }
+        torch.save(metadata, final_model_path)
+        logging.info(f"Final model saved to {final_model_path}")
 
     except Exception as e:
         logging.error(f"Fatal error: {str(e)}")
         logging.error(traceback.format_exc())
         raise
-
 
 
 if __name__ == "__main__":
