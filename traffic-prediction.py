@@ -118,6 +118,7 @@ class DataPreprocessor:
         if self.cache_path.exists():
             cache_size = self.cache_path.stat().st_size / (1024 * 1024)  # Size in MB
             logging.info(f"Found existing cache file ({cache_size:.2f} MB)")
+            logging.info(f"Cache file location: {self.cache_path}")
             start_time = time.time()
             try:
                 # Use safe loading with weights_only=True
@@ -384,7 +385,7 @@ class TrafficPredictor(nn.Module):
 
 
 class TrainingManager:
-    """Highly optimized training manager with CUDA optimizations and memory efficiency"""
+    """Highly optimized training manager with CUDA optimizations, memory efficiency, and ETA tracking"""
 
     def __init__(self, config, district):
         self.config = config
@@ -394,11 +395,10 @@ class TrainingManager:
         self.checkpoint_dir.mkdir(exist_ok=True)
 
         # Enable CUDA optimizations
-        torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for faster matrix multiplications
-        torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
-        torch.backends.cudnn.allow_tf32 = True  # Allow TF32 for cudnn
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.allow_tf32 = True
 
-        # Initialize gradient scaler with dynamic scaling
         self.scaler = torch.amp.GradScaler(
             init_scale=2 ** 16,
             growth_factor=2,
@@ -406,7 +406,6 @@ class TrainingManager:
             growth_interval=2000
         )
 
-        # Pre-allocate pinned memory for faster CPU->GPU transfers
         torch.cuda.empty_cache()
         torch.cuda.memory.empty_cache()
 
@@ -416,46 +415,60 @@ class TrainingManager:
         logging.info(f"  - CUDA memory allocated: {torch.cuda.memory_allocated() / 1024 ** 2:.2f} MB")
         logging.info(f"  - CUDA memory cached: {torch.cuda.memory_reserved() / 1024 ** 2:.2f} MB")
 
+    def _format_time(self, seconds):
+        """Format time in human readable format"""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            minutes = seconds / 60
+            return f"{minutes:.1f}m"
+        else:
+            hours = seconds / 3600
+            return f"{hours:.1f}h"
+
     def train_model(self, model, train_loader):
         model = model.to(self.device)
         model.train()
 
-        # Enable tensor cores if available
         if torch.cuda.get_device_capability()[0] >= 7:
             logging.info("Tensor cores enabled for compatible operations")
 
-        # Log model architecture and parameters
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logging.info(f"Model architecture:")
         logging.info(f"  - Total parameters: {total_params:,}")
         logging.info(f"  - Trainable parameters: {trainable_params:,}")
 
-        # Optimize memory layout
         try:
-            model = torch.jit.script(model)  # JIT compilation for faster execution
+            model = torch.jit.script(model)
         except Exception as e:
             logging.warning(f"JIT compilation failed, using standard model: {str(e)}")
 
-        # Use scaled loss for better numerical stability
         criterion = nn.MSELoss(reduction='mean')
 
-        # Configure optimizer with momentum and nesterov
         optimizer = optim.AdamW(
             model.parameters(),
             lr=float(self.config.config['TRAINING']['learning_rate']),
             weight_decay=0.01,
             betas=(0.9, 0.999),
             eps=1e-8,
-            amsgrad=True  # Enable AMSGrad variant
+            amsgrad=True
         )
 
-        # Performance optimized scheduler
-        total_steps = int(self.config.config['TRAINING']['epochs']) * len(train_loader)
+        # Calculate total iterations and expected time
+        epochs = int(self.config.config['TRAINING']['epochs'])
+        total_batches = len(train_loader)
+        total_iterations = epochs * total_batches
+
+        logging.info(f"Training plan:")
+        logging.info(f"  - Total epochs: {epochs:,}")
+        logging.info(f"  - Batches per epoch: {total_batches:,}")
+        logging.info(f"  - Total iterations: {total_iterations:,}")
+
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=float(self.config.config['TRAINING']['learning_rate']),
-            total_steps=total_steps,
+            total_steps=total_iterations,
             pct_start=0.3,
             anneal_strategy='cos',
             cycle_momentum=True,
@@ -468,108 +481,108 @@ class TrainingManager:
         best_loss = float('inf')
         running_loss = 0.0
 
-        # Initialize CUDA events for timing
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
+        # Initialize timing trackers
+        iterations_complete = 0
+        moving_avg_time_per_batch = None
+        alpha = 0.1  # Smoothing factor for moving average
 
-        for epoch in range(int(self.config.config['TRAINING']['epochs'])):
+        for epoch in range(epochs):
             epoch_start_time = time.time()
-            start_event.record()
 
             progress_bar = tqdm(
                 prefetch_loader,
-                desc=f'Epoch {epoch + 1}/{self.config.config["TRAINING"]["epochs"]}',
-                dynamic_ncols=True  # Adapt to terminal width
+                desc=f'Epoch {epoch + 1}/{epochs}',
+                dynamic_ncols=True
             )
 
             batch_times = []
             for batch_idx, (sequences, targets) in enumerate(progress_bar):
-                batch_start = torch.cuda.Event(enable_timing=True)
-                batch_end = torch.cuda.Event(enable_timing=True)
-                batch_start.record()
+                batch_start = time.time()
 
-                # Zero gradients with optimized memory handling
+                # Training step
                 for param in model.parameters():
                     param.grad = None
 
-                # Compute with automatic mixed precision
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                     outputs = model(sequences)
                     loss = criterion(outputs, targets)
 
-                # Scale loss and backward pass
                 self.scaler.scale(loss).backward()
-
-                # Unscale gradients and clip for stability
                 self.scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                # Update weights with gradient scaling
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 scheduler.step()
 
-                # Efficient loss computation
-                running_loss = 0.99 * running_loss + 0.01 * loss.item()
-
-                # Calculate batch time
-                batch_end.record()
-                torch.cuda.synchronize()
-                batch_time = batch_start.elapsed_time(batch_end) / 1000  # Convert to seconds
+                # Update tracking metrics
+                iterations_complete += 1
+                batch_time = time.time() - batch_start
                 batch_times.append(batch_time)
 
-                # Update progress less frequently
-                if batch_idx % 50 == 0:
+                # Update moving average of time per batch
+                if moving_avg_time_per_batch is None:
+                    moving_avg_time_per_batch = batch_time
+                else:
+                    moving_avg_time_per_batch = (1 - alpha) * moving_avg_time_per_batch + alpha * batch_time
+
+                # Calculate ETA
+                iterations_remaining = total_iterations - iterations_complete
+                estimated_time_remaining = iterations_remaining * moving_avg_time_per_batch
+
+                # Calculate progress metrics
+                progress_percent = (iterations_complete / total_iterations) * 100
+                elapsed_time = time.time() - total_start_time
+
+                running_loss = 0.99 * running_loss + 0.01 * loss.item()
+
+                # Update progress bar with comprehensive metrics
+                if batch_idx % 10 == 0:
                     current_lr = optimizer.param_groups[0]['lr']
                     avg_batch_time = np.mean(batch_times[-100:]) if batch_times else 0
                     progress_bar.set_postfix({
                         'loss': f"{running_loss:.6f}",
-                        'lr': f"{current_lr:.6f}",
-                        'batch_time': f"{avg_batch_time:.3f}s",
-                        'memory': f"{torch.cuda.memory_allocated() / 1024 ** 2:.0f}MB"
+                        'lr': f"{current_lr:.6e}",
+                        'progress': f"{progress_percent:.1f}%",
+                        'it': f"{iterations_complete}/{total_iterations}",
+                        'batch': f"{avg_batch_time:.3f}s",
+                        'ETA': self._format_time(estimated_time_remaining),
+                        'elapsed': self._format_time(elapsed_time)
                     })
 
-            # Record epoch end time
-            end_event.record()
-            torch.cuda.synchronize()
-            epoch_time = start_event.elapsed_time(end_event) / 1000  # Convert to seconds
+            epoch_time = time.time() - epoch_start_time
 
-            # Calculate epoch statistics
-            epoch_loss = running_loss
-
-            # Log epoch statistics
+            # Log detailed epoch statistics
             logging.info(f"Epoch {epoch + 1} completed:")
-            logging.info(f"  - Loss: {epoch_loss:.6f}")
+            logging.info(f"  - Loss: {running_loss:.6f}")
             logging.info(f"  - Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
-            logging.info(f"  - Time: {epoch_time:.2f}s")
-            logging.info(f"  - Average batch time: {np.mean(batch_times):.3f}s")
+            logging.info(f"  - Time: {self._format_time(epoch_time)}")
+            logging.info(f"  - Progress: {progress_percent:.1f}%")
+            logging.info(f"  - Iterations: {iterations_complete:,}/{total_iterations:,}")
+            logging.info(f"  - ETA: {self._format_time(estimated_time_remaining)}")
             logging.info(f"  - CUDA memory: {torch.cuda.memory_allocated() / 1024 ** 2:.0f}MB")
 
-            # Save best model with async I/O
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
-                torch.cuda.synchronize()  # Ensure all CUDA operations are complete
-                self._save_checkpoint(model, optimizer, epoch, epoch_loss)
+            if running_loss < best_loss:
+                best_loss = running_loss
+                torch.cuda.synchronize()
+                self._save_checkpoint(model, optimizer, epoch, running_loss)
                 logging.info(f"  - New best loss achieved!")
 
-            # Periodic checkpoints
             if (epoch + 1) % int(self.config.config['TRAINING']['checkpoint_frequency']) == 0:
-                self._save_checkpoint(model, optimizer, epoch, epoch_loss)
+                self._save_checkpoint(model, optimizer, epoch, running_loss)
 
-            # Clear cache periodically
             if (epoch + 1) % 5 == 0:
                 torch.cuda.empty_cache()
 
         total_time = time.time() - total_start_time
         logging.info(f"Training completed:")
-        logging.info(f"  - Total time: {total_time:.2f}s")
+        logging.info(f"  - Total time: {self._format_time(total_time)}")
         logging.info(f"  - Best loss: {best_loss:.6f}")
+        logging.info(f"  - Average time per iteration: {self._format_time(total_time / iterations_complete)}")
         logging.info(f"  - Final CUDA memory: {torch.cuda.memory_allocated() / 1024 ** 2:.0f}MB")
 
     def _save_checkpoint(self, model, optimizer, epoch, loss):
         checkpoint_path = self.checkpoint_dir / f'district_{self.district}_checkpoint_{epoch + 1}.pt'
 
-        # Create checkpoint with minimal memory overhead
         checkpoint = {
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
@@ -577,12 +590,11 @@ class TrainingManager:
             'loss': loss,
         }
 
-        # Async save with error handling
         try:
             torch.save(
                 checkpoint,
                 checkpoint_path,
-                _use_new_zipfile_serialization=True,  # Use new format for faster saving
+                _use_new_zipfile_serialization=True,
             )
             checkpoint_size = checkpoint_path.stat().st_size / (1024 * 1024)
             logging.info(f"Saved checkpoint {epoch + 1}:")
