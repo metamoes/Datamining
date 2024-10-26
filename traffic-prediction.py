@@ -1,5 +1,9 @@
 import traceback
 import torch
+#error if gpu not detected throw fatal error
+if not torch.cuda.is_available( ):
+    raise RuntimeError("CUDA is not available. Please check your CUDA installation.")
+else: print("CUDA is available continuing with the program")
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
