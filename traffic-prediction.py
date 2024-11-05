@@ -1,29 +1,3 @@
-"""
-Traffic Prediction System using LSTM Neural Networks
-
-This script implements a traffic prediction system that processes and analyzes traffic data
-using LSTM neural networks. It includes adaptive training mechanisms, comprehensive logging,
-and automatic model checkpointing.
-
-Key Features:
-- Memory-efficient data processing using chunked loading
-- LSTM-based neural network with batch normalization
-- Adaptive training with early stopping
-- Comprehensive logging and model checkpointing
-- Support for multiple traffic districts
-- Learning rate scheduling
-- Validation-based model selection
-
-Usage:
-    python traffic_prediction_system.py --min_epochs 50 --max_epochs 500 --district 5
-
-Requirements:
-    - Python 3.8+
-    - PyTorch
-    - pandas
-    - numpy
-    - tqdm
-"""
 
 import gc
 import glob
