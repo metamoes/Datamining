@@ -1,3 +1,4 @@
+import glob
 import gc
 import glob
 import json
@@ -8,12 +9,14 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Union, List, Tuple, Dict
+from typing import List, Iterator, Optional
+from typing import Union, Tuple, Dict
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, IterableDataset
 from tqdm import tqdm
 
 # Initialize basic logging until setup_logging is called
@@ -68,6 +71,163 @@ def setup_logging(model_dir: Path, district: str):
 
     return logger
 
+
+class ChunkedTrafficDataset(IterableDataset):
+    """
+    Memory-efficient dataset that streams data in chunks directly from disk.
+    """
+
+    def __init__(self, file_paths: List[str], sequence_length: int = 12,
+                 chunk_size: int = 10000, shuffle: bool = True,
+                 cache_dir: Optional[Path] = None):
+        super().__init__()
+        self.file_paths = file_paths
+        self.sequence_length = sequence_length
+        self.chunk_size = chunk_size
+        self.shuffle = shuffle
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+
+        # Define feature groups
+        self.temporal_features = [
+            'Hour', 'Day_of_Week', 'Is_Weekend', 'Month', 'Is_Peak_Hour_Normalized'
+        ]
+        self.road_features = [
+            'Station_Length_Normalized', 'Active_Lanes_Normalized',
+            'Direction_S_Normalized', 'Direction_E_Normalized', 'Direction_W_Normalized',
+            'Lane_Type_FR_Normalized', 'Lane_Type_ML_Normalized', 'Lane_Type_OR_Normalized'
+        ]
+        self.traffic_features = [
+            'Total_Flow_Normalized', 'Avg_Occupancy_Normalized', 'Avg_Speed_Normalized'
+        ]
+        self.lane_features = []
+        for lane in range(1, 5):
+            self.lane_features.extend([
+                f'Lane_{lane}_Flow_Normalized',
+                f'Lane_{lane}_Avg_Occ_Normalized',
+                f'Lane_{lane}_Avg_Speed_Normalized',
+                f'Lane_{lane}_Efficiency_Normalized'
+            ])
+
+        self.feature_cols = (
+                self.temporal_features +
+                self.road_features +
+                self.traffic_features +
+                self.lane_features
+        )
+        self.target_col = 'Total_Flow_Normalized'
+
+        # Calculate dataset properties
+        self.input_size = len(self.feature_cols)  # Number of features
+        self.total_samples = self._estimate_total_samples()
+
+    def get_input_size(self) -> int:
+        """Return the number of input features"""
+        return self.input_size
+
+    def _estimate_total_samples(self) -> int:
+        """Estimate total number of samples without loading entire dataset"""
+        total = 0
+        for file_path in tqdm(self.file_paths, desc="Estimating dataset size"):
+            try:
+                file_size = Path(file_path).stat().st_size
+                first_chunk = pd.read_csv(file_path, nrows=1000)
+                avg_row_size = file_size / len(first_chunk)
+                estimated_rows = int(file_size / avg_row_size)
+                total += max(0, estimated_rows - self.sequence_length)
+            except Exception as e:
+                print(f"Warning: Could not estimate size for {file_path}: {e}")
+        return total
+
+    def _process_chunk(self, chunk: pd.DataFrame) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        """Process a single chunk of data into sequences"""
+        try:
+            # Basic preprocessing
+            chunk['Timestamp'] = pd.to_datetime(chunk['Timestamp'])
+            chunk = chunk.sort_values('Timestamp')
+
+            # Extract features and handle missing values
+            features_df = chunk[self.feature_cols].ffill().fillna(0)
+            targets_series = chunk[self.target_col].ffill().fillna(0)
+
+            data = features_df.values
+            targets = targets_series.values
+
+            # Create sequences
+            for i in range(0, len(data) - self.sequence_length):
+                x = data[i:i + self.sequence_length]
+                y = targets[i + self.sequence_length - 1]
+
+                if len(x) == self.sequence_length:
+                    yield torch.FloatTensor(x), torch.FloatTensor([y])
+
+        except Exception as e:
+            print(f"Warning: Error processing chunk: {e}")
+            return iter([])
+
+    def _get_file_iterator(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        """Create an iterator over all files"""
+        file_paths = self.file_paths.copy()
+        if self.shuffle:
+            np.random.shuffle(file_paths)
+
+        for file_path in file_paths:
+            try:
+                for chunk in pd.read_csv(file_path, chunksize=self.chunk_size):
+                    yield from self._process_chunk(chunk)
+
+                    # Clean up memory
+                    del chunk
+                    gc.collect()
+
+            except Exception as e:
+                print(f"Warning: Could not process file {file_path}: {e}")
+                continue
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        """Return an iterator over the dataset"""
+        return self._get_file_iterator()
+
+    def __len__(self) -> int:
+        """Return approximate length of dataset"""
+        return self.total_samples
+
+
+class StreamingDataLoader:
+    """
+    Custom data loader that handles streaming data with prefetching
+    """
+
+    def __init__(self, dataset: ChunkedTrafficDataset, batch_size: int = 32,
+                 num_workers: int = 4, prefetch_factor: int = 2):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
+
+    def _create_batch(self, samples: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Create a batch from a list of samples"""
+        sequences, targets = zip(*samples)
+        return (
+            torch.stack(sequences),
+            torch.stack(targets)
+        )
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        """Iterate over batches"""
+        batch = []
+        for sample in self.dataset:
+            batch.append(sample)
+            if len(batch) == self.batch_size:
+                yield self._create_batch(batch)
+                batch = []
+
+        # Yield last batch if not empty
+        if batch:
+            yield self._create_batch(batch)
+
+    def __len__(self) -> int:
+        """Return approximate number of batches"""
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
 class TrainingMetrics:
     """
@@ -567,7 +727,7 @@ class TrafficPredictor:
 
     def train_district_model(self, district, min_epochs, max_epochs):
         """
-        Train model for a specific district with adaptive stopping criteria.
+        Train model for a specific district with fixed progress tracking and updated CUDA handling.
         """
         global logger
         logger = setup_logging(self.model_dir, district)
@@ -577,64 +737,63 @@ class TrafficPredictor:
             files = self._get_district_files(district)
             train_files, val_files = self._split_data(files)
 
-            # Create datasets with smaller batch sizes and memory management
+            # Create datasets with optimized chunk sizes for GPU memory
             logger.info("Creating training dataset...")
-            train_dataset = TrafficDataset(
+            train_dataset = ChunkedTrafficDataset(
                 train_files,
-                preprocessing_chunk_size=50000
+                sequence_length=12,
+                chunk_size=5000,
+                shuffle=True
             )
-            logger.info(f"Training dataset created with {len(train_dataset)} samples")
+            total_train_samples = train_dataset.total_samples
+            train_iterations = total_train_samples // 32  # based on batch_size
+            logger.info(
+                f"Training dataset created with {total_train_samples:,} samples ({train_iterations:,} iterations)")
 
             logger.info("Creating validation dataset...")
-            val_dataset = TrafficDataset(
+            val_dataset = ChunkedTrafficDataset(
                 val_files,
-                preprocessing_chunk_size=50000
+                sequence_length=12,
+                chunk_size=5000,
+                shuffle=False
             )
-            logger.info(f"Validation dataset created with {len(val_dataset)} samples")
+            total_val_samples = val_dataset.total_samples
+            val_iterations = total_val_samples // 64  # based on validation batch_size
+            logger.info(
+                f"Validation dataset created with {total_val_samples:,} samples ({val_iterations:,} iterations)")
 
-            # Modified data loader settings for better memory management
-            logger.info("Creating data loaders...")
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=16,
-                shuffle=True,
-                num_workers=2,
-                pin_memory=True,
-                prefetch_factor=2,
-                persistent_workers=True,
-                drop_last=True
-            )
+            input_size = train_dataset.input_size
+            logger.info(f"Input size: {input_size} features")
 
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=16,
-                shuffle=False,
-                num_workers=2,
-                pin_memory=True,
-                prefetch_factor=2,
-                persistent_workers=True,
-                drop_last=True
-            )
-
-            # Initialize model with gradient clipping
-            input_size = train_dataset.sequences.shape[2]
+            # Initialize model and move to GPU
             model = TrafficLSTM(input_size=input_size).to(self.device)
+            logger.info(f"Model initialized on {self.device}")
 
-            # Modified optimizer with gradient clipping
+            # Create data loaders with prefetching
+            logger.info("Creating data loaders...")
+            train_loader = StreamingDataLoader(
+                train_dataset,
+                batch_size=32,
+                num_workers=4,
+                prefetch_factor=2
+            )
+
+            val_loader = StreamingDataLoader(
+                val_dataset,
+                batch_size=64,
+                num_workers=2,
+                prefetch_factor=2
+            )
+
+            # Optimizer with gradient clipping
             optimizer = torch.optim.Adam(model.parameters(), lr=0.001, eps=1e-8)
             criterion = nn.MSELoss()
 
-            # Corrected scheduler import and initialization
+            # Updated scheduler initialization without verbose parameter
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=0.5,
-                patience=5,
-                verbose=True,
-                min_lr=1e-6
+                optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
             )
 
-            # Initialize metrics with adjusted parameters
             metrics = TrainingMetrics(
                 patience=10,
                 min_epochs=min_epochs,
@@ -642,105 +801,156 @@ class TrafficPredictor:
                 improvement_threshold=0.0005
             )
 
-            # Log initial memory state
-            self._log_memory_usage()
+            # Updated GradScaler initialization
+            scaler = torch.amp.GradScaler('cuda')
 
-            # Training loop with error handling and memory management
+            if torch.cuda.is_available():
+                logger.info(f"Initial GPU Memory: {torch.cuda.memory_allocated() / 1024 ** 2:.1f}MB allocated")
+
+            # Estimate total training time
+            estimated_seconds_per_epoch = (
+                    (train_iterations * 0.1) +  # Estimated time per training iteration
+                    (val_iterations * 0.05)  # Estimated time per validation iteration
+            )
+            estimated_total_time = time.strftime('%H:%M:%S', time.gmtime(estimated_seconds_per_epoch * max_epochs))
+            logger.info(f"Estimated maximum training time: {estimated_total_time} (HH:MM:SS)")
+
             epoch = 0
-            batch_log_interval = 50  # Reduced logging frequency
+            epoch_times = []
 
             while True:
                 epoch += 1
+                epoch_start_time = time.time()
                 model.train()
                 total_train_loss = 0
-                last_log_time = time.time()
-                batch_times = []
+                batch_count = 0
 
-                try:
-                    # Training phase with error handling
-                    progress_bar = tqdm(train_loader, desc=f'Epoch {epoch}')
-                    for batch_idx, (data, target) in enumerate(progress_bar):
-                        try:
-                            # Move data to device
-                            data = data.to(self.device, non_blocking=True)
-                            target = target.to(self.device, non_blocking=True)
+                # Fixed progress bar initialization
+                train_progress = tqdm(
+                    total=train_iterations,
+                    desc=f'Epoch {epoch}/{max_epochs}',
+                    unit='batch',
+                    dynamic_ncols=True,  # Automatically adjust to terminal width
+                    leave=True
+                )
 
-                            # Training step with gradient clipping
-                            optimizer.zero_grad(set_to_none=True)  # More memory efficient
+                for batch_idx, (data, target) in enumerate(train_loader):
+                    try:
+                        data = data.to(self.device, non_blocking=True)
+                        target = target.to(self.device, non_blocking=True)
+
+                        with torch.amp.autocast('cuda'):
                             output = model(data)
                             loss = criterion(output, target)
-                            loss.backward()
 
-                            # Add gradient clipping
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
 
-                            optimizer.step()
+                        total_train_loss += loss.item()
+                        batch_count += 1
 
-                            # Update metrics
-                            total_train_loss += loss.item()
-                            avg_loss = total_train_loss / (batch_idx + 1)
+                        # Update progress
+                        current_loss = total_train_loss / batch_count
+                        gpu_mem = torch.cuda.memory_allocated() / 1024 ** 2 if torch.cuda.is_available() else 0
 
-                            # Update progress bar
-                            progress_bar.set_postfix({
-                                'train_loss': f'{avg_loss:.6f}',
-                                'batch': f'{batch_idx}/{len(train_loader)}'
-                            })
-
-                            # Clean up GPU memory
-                            del data, target, output, loss
-                            if batch_idx % 100 == 0:  # Periodic memory cleanup
-                                torch.cuda.empty_cache()
-
-                        except RuntimeError as e:
-                            if "out of memory" in str(e):
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                logger.warning(f"Out of memory in batch {batch_idx}. Skipping batch...")
-                                continue
-                            else:
-                                raise e
-
-                    # Validation phase
-                    avg_train_loss = total_train_loss / len(train_loader)
-                    avg_val_loss = self.validate_model(model, val_loader, criterion)
-
-                    # Log epoch results
-                    logger.info(
-                        f"Epoch {epoch} - "
-                        f"Train Loss: {avg_train_loss:.6f}, "
-                        f"Val Loss: {avg_val_loss:.6f}, "
-                        f"LR: {optimizer.param_groups[0]['lr']:.6f}"
-                    )
-
-                    # Update learning rate
-                    scheduler.step(avg_val_loss)
-
-                    # Update metrics and check if training should continue
-                    should_continue = metrics.update(
-                        epoch, avg_train_loss, avg_val_loss,
-                        optimizer.param_groups[0]['lr']
-                    )
-
-                    # Save checkpoints
-                    if avg_val_loss <= metrics.best_loss:
-                        self.save_model(model, district, epoch, metrics, is_best=True)
-
-                    if epoch % 5 == 0:  # More frequent checkpoints
-                        self.save_model(model, district, epoch, metrics)
-
-                    # Check if training should stop
-                    if not should_continue:
-                        logger.info(
-                            f"Training stopped after {epoch} epochs. "
-                            f"Best validation loss: {metrics.best_loss:.6f}"
+                        train_progress.set_description(
+                            f'Epoch {epoch}/{max_epochs} - Loss: {current_loss:.6f} - GPU: {gpu_mem:.1f}MB'
                         )
-                        break
+                        train_progress.update()
 
-                except Exception as e:
-                    logger.error(f"Error in epoch {epoch}: {str(e)}")
-                    raise
+                        if batch_idx % 50 == 0:
+                            del data, target, output, loss
+                            torch.cuda.empty_cache()
 
-                # Clean up memory between epochs
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            logger.warning(f"GPU OOM in batch {batch_idx}. Cleaning memory...")
+                            del data, target, output, loss
+                            torch.cuda.empty_cache()
+                            continue
+                        raise e
+
+                train_progress.close()
+                avg_train_loss = total_train_loss / batch_count if batch_count > 0 else float('inf')
+
+                # Validation phase
+                model.eval()
+                total_val_loss = 0
+                val_batch_count = 0
+
+                val_progress = tqdm(
+                    total=val_iterations,
+                    desc='Validation',
+                    unit='batch',
+                    dynamic_ncols=True,
+                    leave=True
+                )
+
+                with torch.no_grad():
+                    for batch_idx, (data, target) in enumerate(val_loader):
+                        data = data.to(self.device, non_blocking=True)
+                        target = target.to(self.device, non_blocking=True)
+
+                        with torch.amp.autocast('cuda'):
+                            output = model(data)
+                            loss = criterion(output, target)
+
+                        total_val_loss += loss.item()
+                        val_batch_count += 1
+
+                        # Update validation progress
+                        current_val_loss = total_val_loss / val_batch_count
+                        val_progress.set_description(
+                            f'Validation - Loss: {current_val_loss:.6f}'
+                        )
+                        val_progress.update()
+
+                val_progress.close()
+                avg_val_loss = total_val_loss / val_batch_count if val_batch_count > 0 else float('inf')
+
+                # Calculate epoch time and estimates
+                epoch_time = time.time() - epoch_start_time
+                epoch_times.append(epoch_time)
+                avg_epoch_time = sum(epoch_times) / len(epoch_times)
+                remaining_epochs = max_epochs - epoch
+                estimated_remaining_time = time.strftime('%H:%M:%S', time.gmtime(avg_epoch_time * remaining_epochs))
+
+                # Log epoch results
+                logger.info(
+                    f"Epoch {epoch}/{max_epochs} - "
+                    f"Time: {time.strftime('%H:%M:%S', time.gmtime(epoch_time))} - "
+                    f"Est. Remaining: {estimated_remaining_time} - "
+                    f"Train Loss: {avg_train_loss:.6f} - "
+                    f"Val Loss: {avg_val_loss:.6f} - "
+                    f"LR: {optimizer.param_groups[0]['lr']:.6f} - "
+                    f"GPU: {torch.cuda.memory_allocated() / 1024 ** 2:.1f}MB"
+                )
+
+                scheduler.step(avg_val_loss)
+
+                should_continue = metrics.update(
+                    epoch, avg_train_loss, avg_val_loss,
+                    optimizer.param_groups[0]['lr']
+                )
+
+                if avg_val_loss <= metrics.best_loss:
+                    self.save_model(model, district, epoch, metrics, is_best=True)
+
+                if epoch % 5 == 0:
+                    self.save_model(model, district, epoch, metrics)
+
+                if not should_continue:
+                    total_training_time = time.strftime('%H:%M:%S', time.gmtime(sum(epoch_times)))
+                    logger.info(
+                        f"Training completed after {epoch} epochs in {total_training_time} - "
+                        f"Best validation loss: {metrics.best_loss:.6f}"
+                    )
+                    break
+
                 gc.collect()
                 torch.cuda.empty_cache()
 
