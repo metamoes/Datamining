@@ -431,19 +431,19 @@ class TrafficPredictor:
 
     def _split_data(self, files: List[str], val_ratio: float = 0.2) -> Tuple[List[str], List[str]]:
         """
-        Split files into train and validation sets and copy validation files to a separate directory
+        Split files into train and validation sets using modulo selection (every 5th file)
+        and copy validation files to a separate directory.
 
         Args:
             files: List of file paths
-            val_ratio: Ratio of validation files (default: 0.2 or 20%)
+            val_ratio: Ignored in this implementation as we use modulo selection
 
         Returns:
             Tuple[List[str], List[str]]: Lists of training and validation file paths
         """
-        # Calculate split
-        train_size = int((1 - val_ratio) * len(files))
-        train_files = files[:train_size]
-        val_files = files[train_size:]
+        # Use modulo to select validation files (every 5th file)
+        train_files = [f for i, f in enumerate(files) if i % 5 != 0]
+        val_files = [f for i, f in enumerate(files) if i % 5 == 0]
 
         logger.info(f"Data split - Training files: {len(train_files)}, Validation files: {len(val_files)}")
 
@@ -639,7 +639,7 @@ class TrafficPredictor:
                 patience=10,
                 min_epochs=min_epochs,
                 max_epochs=max_epochs,
-                improvement_threshold=0.001
+                improvement_threshold=0.0005
             )
 
             # Log initial memory state
