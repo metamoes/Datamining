@@ -1,4 +1,3 @@
-import glob
 import gc
 import glob
 import json
@@ -9,13 +8,13 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Iterator, Optional
-from typing import Union, Tuple, Dict
+from typing import List, Iterator, Optional, Tuple, Union, Dict
+import h5py
 import numpy as np
 import pandas as pd
+import redis
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 from torch.utils.data import Dataset, IterableDataset
 from tqdm import tqdm
 
@@ -72,161 +71,754 @@ def setup_logging(model_dir: Path, district: str):
     return logger
 
 
+class ValidationDebugger:
+    """
+    Utility class to debug validation issues including INF and NaN values.
+    """
+
+    def __init__(self, logger=None):
+        self.logger = logger or logging.getLogger(__name__)
+
+    def check_tensor_values(self, tensor: torch.Tensor, name: str) -> Tuple[bool, Optional[str]]:
+        """
+        Check tensor for invalid values and basic statistics.
+        Returns (is_valid, error_message)
+        """
+        if not torch.is_tensor(tensor):
+            return False, f"{name} is not a tensor"
+
+        try:
+            # Check for NaN and INF
+            if torch.isnan(tensor).any():
+                return False, f"{name} contains NaN values"
+            if torch.isinf(tensor).any():
+                return False, f"{name} contains INF values"
+
+            # Get statistics
+            stats = {
+                'min': float(tensor.min()),
+                'max': float(tensor.max()),
+                'mean': float(tensor.mean()),
+                'std': float(tensor.std())
+            }
+
+            # Check for suspicious values
+            if abs(stats['mean']) > 1e6 or stats['std'] > 1e6:
+                return False, f"{name} has suspicious statistics: {stats}"
+
+            self.logger.debug(f"{name} statistics: {stats}")
+            return True, None
+
+        except Exception as e:
+            return False, f"Error checking {name}: {str(e)}"
+
+    def debug_validation_batch(self, data: torch.Tensor, target: torch.Tensor,
+                               output: torch.Tensor, loss: torch.Tensor) -> bool:
+        """
+        Debug a single validation batch.
+        Returns True if batch is valid, False otherwise.
+        """
+        # Check input data
+        valid, error = self.check_tensor_values(data, "Input data")
+        if not valid:
+            self.logger.error(error)
+            return False
+
+        # Check target values
+        valid, error = self.check_tensor_values(target, "Target values")
+        if not valid:
+            self.logger.error(error)
+            return False
+
+        # Check model output
+        valid, error = self.check_tensor_values(output, "Model output")
+        if not valid:
+            self.logger.error(error)
+            return False
+
+        # Check loss value
+        if loss.item() == float('inf') or loss.item() == float('-inf'):
+            self.logger.error(f"Loss is INF: {loss.item()}")
+            return False
+        if torch.isnan(loss):
+            self.logger.error("Loss is NaN")
+            return False
+
+        return True
+
+    def analyze_data_distribution(self, loader) -> dict:
+        """
+        Analyze the distribution of values in the dataset.
+        """
+        stats = {
+            'data_min': float('inf'),
+            'data_max': float('-inf'),
+            'target_min': float('inf'),
+            'target_max': float('-inf'),
+            'total_samples': 0,
+            'invalid_samples': 0
+        }
+
+        for data, target in loader:
+            stats['total_samples'] += data.size(0)
+
+            # Check for invalid values
+            if torch.isnan(data).any() or torch.isinf(data).any():
+                stats['invalid_samples'] += data.size(0)
+                continue
+
+            stats['data_min'] = min(stats['data_min'], float(data.min()))
+            stats['data_max'] = max(stats['data_max'], float(data.max()))
+            stats['target_min'] = min(stats['target_min'], float(target.min()))
+            stats['target_max'] = max(stats['target_max'], float(target.max()))
+
+        return stats
+
+
+def validate_with_debugging(model: torch.nn.Module,
+                            val_loader: torch.utils.data.DataLoader,
+                            criterion: torch.nn.Module,
+                            device: torch.device) -> float:
+    """
+    Enhanced validation function with debugging capabilities.
+    """
+    model.eval()
+    debugger = ValidationDebugger()
+    total_loss = 0
+    batch_count = 0
+
+    try:
+        # Analyze dataset distribution first
+        data_stats = debugger.analyze_data_distribution(val_loader)
+        debugger.logger.info(f"Dataset statistics: {data_stats}")
+
+        with torch.no_grad():
+            for data, target in val_loader:
+                try:
+                    data, target = data.to(device), target.to(device)
+
+                    # Run model with gradient hooks for debugging
+                    output = model(data)
+                    loss = criterion(output, target)
+
+                    # Debug this batch
+                    if not debugger.debug_validation_batch(data, target, output, loss):
+                        debugger.logger.warning(f"Invalid batch detected at index {batch_count}")
+                        continue
+
+                    total_loss += loss.item()
+                    batch_count += 1
+
+                except RuntimeError as e:
+                    debugger.logger.error(f"Runtime error in batch {batch_count}: {str(e)}")
+                    continue
+                finally:
+                    # Clean up memory
+                    del data, target, output
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        if batch_count == 0:
+            debugger.logger.error("No valid batches processed during validation")
+            return float('inf')
+
+        return total_loss / batch_count
+
+    except Exception as e:
+        debugger.logger.error(f"Validation failed: {str(e)}")
+        return float('inf')
+
+
 class ChunkedTrafficDataset(IterableDataset):
     """
-    Memory-efficient dataset that streams data in chunks directly from disk.
+    Memory-efficient dataset using Redis for metadata and HDF5 for sequence storage.
+    Updated to handle the new data structure.
     """
 
     def __init__(self, file_paths: List[str], sequence_length: int = 12,
                  chunk_size: int = 10000, shuffle: bool = True,
-                 cache_dir: Optional[Path] = None):
+                 cache_dir: Optional[Path] = None,
+                 redis_host: str = 'localhost',
+                 redis_port: int = 6379,
+                 redis_db: int = 0):
+        """Initialize with improved data validation"""
         super().__init__()
         self.file_paths = file_paths
         self.sequence_length = sequence_length
         self.chunk_size = chunk_size
         self.shuffle = shuffle
-        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.cache_dir = Path(cache_dir) if cache_dir else Path("cache")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Define feature groups
-        self.temporal_features = [
-            'Hour', 'Day_of_Week', 'Is_Weekend', 'Month', 'Is_Peak_Hour_Normalized'
-        ]
-        self.road_features = [
-            'Station_Length_Normalized', 'Active_Lanes_Normalized',
-            'Direction_S_Normalized', 'Direction_E_Normalized', 'Direction_W_Normalized',
-            'Lane_Type_FR_Normalized', 'Lane_Type_ML_Normalized', 'Lane_Type_OR_Normalized'
-        ]
-        self.traffic_features = [
-            'Total_Flow_Normalized', 'Avg_Occupancy_Normalized', 'Avg_Speed_Normalized'
-        ]
-        self.lane_features = []
-        for lane in range(1, 5):
-            self.lane_features.extend([
-                f'Lane_{lane}_Flow_Normalized',
-                f'Lane_{lane}_Avg_Occ_Normalized',
-                f'Lane_{lane}_Avg_Speed_Normalized',
-                f'Lane_{lane}_Efficiency_Normalized'
-            ])
-
-        self.feature_cols = (
-                self.temporal_features +
-                self.road_features +
-                self.traffic_features +
-                self.lane_features
-        )
-        self.target_col = 'Total_Flow_Normalized'
-
-        # Calculate dataset properties
-        self.input_size = len(self.feature_cols)  # Number of features
-        self.total_samples = self._estimate_total_samples()
-
-    def get_input_size(self) -> int:
-        """Return the number of input features"""
-        return self.input_size
-
-    def _estimate_total_samples(self) -> int:
-        """Estimate total number of samples without loading entire dataset"""
-        total = 0
-        for file_path in tqdm(self.file_paths, desc="Estimating dataset size"):
-            try:
-                file_size = Path(file_path).stat().st_size
-                first_chunk = pd.read_csv(file_path, nrows=1000)
-                avg_row_size = file_size / len(first_chunk)
-                estimated_rows = int(file_size / avg_row_size)
-                total += max(0, estimated_rows - self.sequence_length)
-            except Exception as e:
-                print(f"Warning: Could not estimate size for {file_path}: {e}")
-        return total
-
-    def _process_chunk(self, chunk: pd.DataFrame) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        """Process a single chunk of data into sequences"""
+        # Sample first file to validate structure
         try:
-            # Basic preprocessing
-            chunk['Timestamp'] = pd.to_datetime(chunk['Timestamp'])
-            chunk = chunk.sort_values('Timestamp')
+            sample_df = pd.read_csv(file_paths[0], nrows=5)
+            logger.info(f"Sample data shape: {sample_df.shape}")
+            logger.info(f"Sample columns: {sample_df.columns.tolist()}")
+        except Exception as e:
+            logger.error(f"Error reading sample file: {str(e)}")
+            raise
 
-            # Extract features and handle missing values
-            features_df = chunk[self.feature_cols].ffill().fillna(0)
-            targets_series = chunk[self.target_col].ffill().fillna(0)
+        # Updated feature groups based on the new data structure
+        self.required_features = [
+            'Is_Peak_Hour_Normalized',
+            'Station_Length_Normalized',
+            'Total_Flow_Normalized',
+            'Avg_Occupancy_Normalized',
+            'Avg_Speed_Normalized',
+            'Direction_S_Normalized',
+            'Direction_E_Normalized',
+            'Direction_W_Normalized',
+            'Lane_Type_FR_Normalized',
+            'Lane_Type_ML_Normalized',
+            'Lane_Type_OR_Normalized',
+            'Active_Lanes_Normalized',
+            'Lane_1_Flow_Normalized',
+            'Lane_1_Avg_Occ_Normalized',
+            'Lane_1_Avg_Speed_Normalized',
+            'Lane_1_Efficiency_Normalized',
+            'Lane_2_Flow_Normalized',
+            'Lane_2_Avg_Occ_Normalized',
+            'Lane_2_Avg_Speed_Normalized',
+            'Lane_2_Efficiency_Normalized',
+            'Lane_3_Flow_Normalized',
+            'Lane_3_Avg_Occ_Normalized',
+            'Lane_3_Avg_Speed_Normalized',
+            'Lane_3_Efficiency_Normalized',
+            'Lane_4_Flow_Normalized',
+            'Lane_4_Avg_Occ_Normalized',
+            'Lane_4_Avg_Speed_Normalized',
+            'Lane_4_Efficiency_Normalized'
+        ]
 
-            data = features_df.values
-            targets = targets_series.values
+        # Additional temporal features
+        self.temporal_features = [
+            'Hour',
+            'Day_of_Week',
+            'Is_Weekend',
+            'Month'
+        ]
 
-            # Create sequences
-            for i in range(0, len(data) - self.sequence_length):
-                x = data[i:i + self.sequence_length]
-                y = targets[i + self.sequence_length - 1]
+        # Combined feature list
+        self.feature_cols = self.required_features
 
-                if len(x) == self.sequence_length:
-                    yield torch.FloatTensor(x), torch.FloatTensor([y])
+        # Validate features exist in data
+        missing_features = set(self.feature_cols) - set(sample_df.columns)
+        if missing_features:
+            logger.error(f"Missing required features in data: {missing_features}")
+            raise ValueError(f"Missing required features: {missing_features}")
+
+        self.target_col = 'Total_Flow_Normalized'
+        if self.target_col not in sample_df.columns:
+            raise ValueError(f"Target column '{self.target_col}' not found in data")
+
+        # Log feature configuration
+        logger.info(f"Using {len(self.feature_cols)} features for prediction")
+        logger.info(f"Features: {self.feature_cols}")
+
+        # Set up Redis connection with retry logic
+        for attempt in range(3):
+            try:
+                self.redis_client = redis.Redis(
+                    host=redis_host,
+                    port=redis_port,
+                    db=redis_db,
+                    decode_responses=False,
+                    socket_timeout=5,
+                    socket_connect_timeout=5
+                )
+                self.redis_client.ping()
+                break
+            except redis.ConnectionError as e:
+                if attempt == 2:
+                    raise ConnectionError(f"Failed to connect to Redis after 3 attempts: {e}")
+                time.sleep(1)
+
+        # HDF5 path for sequence storage
+        self.h5_path = self.cache_dir / "sequences.h5"
+
+        # Input size for the model (28 features)
+        self.input_size = len(self.feature_cols)
+        logger.info(f"Input size: {self.input_size} features")
+
+        # Initialize storage and process data
+        self._init_storage()
+        self._process_files()
+
+        # Get total samples
+        try:
+            total_samples = self.redis_client.get('total_samples')
+            self.total_samples = int(total_samples) if total_samples else 0
+            if self.total_samples <= 0:
+                raise ValueError("No valid samples found in dataset")
+            logger.info(f"Total samples in dataset: {self.total_samples:,}")
+        except Exception as e:
+            logger.error(f"Error getting total samples: {e}")
+            raise
+
+    def _validate_sequence(self, sequence: np.ndarray, target: float) -> bool:
+        """Validate a single sequence"""
+        try:
+            # Basic shape check
+            if sequence.shape[0] != self.sequence_length:
+                return False
+
+            # Check for required features
+            if sequence.shape[1] != len(self.feature_cols):
+                return False
+
+            # Check for NaN/Inf values
+            if np.isnan(sequence).any() or np.isnan(target):
+                return False
+            if np.isinf(sequence).any() or np.isinf(target):
+                return False
+
+            # Ensure all values are finite
+            if not np.all(np.isfinite(sequence)) or not np.isfinite(target):
+                return False
+
+            return True
 
         except Exception as e:
-            print(f"Warning: Error processing chunk: {e}")
-            return iter([])
+            logger.error(f"Error in sequence validation: {str(e)}")
+            return False
 
-    def _get_file_iterator(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        """Create an iterator over all files"""
-        file_paths = self.file_paths.copy()
-        if self.shuffle:
-            np.random.shuffle(file_paths)
+    def _process_chunk(self, chunk: pd.DataFrame) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """Process chunk with proper data reading and validation"""
+        sequences = []
+        targets = []
 
-        for file_path in file_paths:
-            try:
-                for chunk in pd.read_csv(file_path, chunksize=self.chunk_size):
-                    yield from self._process_chunk(chunk)
+        try:
+            # Log chunk info
+            logger.info(f"Processing chunk with shape: {chunk.shape}")
 
-                    # Clean up memory
-                    del chunk
-                    gc.collect()
+            # Verify required columns
+            missing_cols = set(self.feature_cols) - set(chunk.columns)
+            if missing_cols:
+                logger.error(f"Missing required columns: {missing_cols}")
+                logger.info(f"Available columns: {chunk.columns.tolist()}")
+                return [], []
 
-            except Exception as e:
-                print(f"Warning: Could not process file {file_path}: {e}")
-                continue
+            # Extract features and targets
+            features_df = chunk[self.feature_cols].copy()
+            targets_series = chunk[self.target_col].copy()
+
+            # Convert to numeric, replacing any non-numeric values with NaN
+            features_df = features_df.apply(pd.to_numeric, errors='coerce')
+            targets_series = pd.to_numeric(targets_series, errors='coerce')
+
+            # Handle missing values
+            features_df = features_df.fillna(method='ffill').fillna(method='bfill').fillna(0)
+            targets_series = targets_series.fillna(method='ffill').fillna(method='bfill').fillna(0)
+
+            # Convert to numpy arrays
+            data = features_df.values.astype(np.float32)
+            targets_data = targets_series.values.astype(np.float32)
+
+            logger.info(f"Data shape: {data.shape}")
+            logger.info(f"Target shape: {targets_data.shape}")
+
+            # Create sequences
+            for i in range(len(data) - self.sequence_length + 1):
+                sequence = data[i:(i + self.sequence_length)]
+                target = targets_data[i + self.sequence_length - 1]
+
+                if self._validate_sequence(sequence, target):
+                    sequences.append(sequence)
+                    targets.append(np.array([target]))
+
+            logger.info(f"Created {len(sequences)} valid sequences")
+
+            if not sequences:
+                logger.warning("No valid sequences created. Sample data:")
+                logger.warning(features_df.head())
+                logger.warning("Sample statistics:")
+                logger.warning(features_df.describe())
+
+        except Exception as e:
+            logger.error(f"Error processing chunk: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return [], []
+
+        return sequences, targets
+
+    def _validate_sequence_with_reason(self, sequence: np.ndarray, target: float) -> Tuple[bool, str]:
+        """Validate sequence with detailed reason for failure"""
+        try:
+            # Shape check
+            if sequence.shape[0] != self.sequence_length:
+                return False, f"Wrong sequence length: {sequence.shape[0]} vs expected {self.sequence_length}"
+
+            # Feature count check
+            if sequence.shape[1] != len(self.feature_cols):
+                return False, f"Wrong feature count: {sequence.shape[1]} vs expected {len(self.feature_cols)}"
+
+            # NaN check
+            if np.isnan(sequence).any():
+                nan_count = np.isnan(sequence).sum()
+                return False, f"Contains {nan_count} NaN values in sequence"
+            if np.isnan(target):
+                return False, "NaN target value"
+
+            # Inf check
+            if np.isinf(sequence).any():
+                inf_count = np.isinf(sequence).sum()
+                return False, f"Contains {inf_count} infinite values in sequence"
+            if np.isinf(target):
+                return False, "Infinite target value"
+
+            # Value range check
+            sequence_min = np.min(sequence)
+            sequence_max = np.max(sequence)
+            if sequence_min < -10 or sequence_max > 10:
+                return False, f"Values out of expected range: min={sequence_min}, max={sequence_max}"
+
+            return True, "valid"
+
+        except Exception as e:
+            return False, f"Validation error: {str(e)}"
+
+    def _validate_arrays(self, sequences: np.ndarray, targets: np.ndarray) -> bool:
+        """Validate arrays before writing to HDF5"""
+        try:
+            # Check shapes
+            if sequences.shape[0] != targets.shape[0]:
+                logger.error("Sequence and target counts don't match")
+                return False
+
+            if sequences.shape[1] != self.sequence_length:
+                logger.error(f"Invalid sequence length: {sequences.shape[1]}")
+                return False
+
+            if sequences.shape[2] != self.input_size:
+                logger.error(f"Invalid feature count: {sequences.shape[2]}, expected {self.input_size}")
+                return False
+
+            # Check for NaN/inf values
+            if np.isnan(sequences).any() or np.isnan(targets).any():
+                logger.error("Arrays contain NaN values")
+                return False
+
+            if np.isinf(sequences).any() or np.isinf(targets).any():
+                logger.error("Arrays contain infinite values")
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error validating arrays: {str(e)}")
+            return False
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        """Return an iterator over the dataset"""
-        return self._get_file_iterator()
+        """
+        Improved iterator with proper indexing and error handling.
+        """
+        worker_info = torch.utils.data.get_worker_info()
+
+        try:
+            with h5py.File(self.h5_path, 'r') as f:
+                total_sequences = f['sequences'].shape[0]
+
+                # Generate all indices first
+                if worker_info is None:
+                    # Single worker case
+                    indices = np.arange(total_sequences)
+                else:
+                    # Multiple worker case - split indices among workers
+                    per_worker = total_sequences // worker_info.num_workers
+                    worker_id = worker_info.id
+                    start_idx = worker_id * per_worker
+                    end_idx = start_idx + per_worker if worker_id < worker_info.num_workers - 1 else total_sequences
+                    indices = np.arange(start_idx, end_idx)
+
+                # Shuffle if needed
+                if self.shuffle:
+                    np.random.shuffle(indices)
+
+                # Process in chunks with sorted access
+                chunk_size = 1000  # Adjust this based on memory constraints
+                for chunk_start in range(0, len(indices), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(indices))
+                    chunk_indices = indices[chunk_start:chunk_end]
+
+                    # Sort indices for HDF5 access
+                    sorted_indices = np.sort(chunk_indices)
+
+                    # Load data
+                    sequences = f['sequences'][sorted_indices]
+                    targets = f['targets'][sorted_indices]
+
+                    # Create index mapping to restore shuffled order
+                    restore_order = np.argsort(np.argsort(chunk_indices))
+
+                    # Yield sequences in original shuffled order
+                    for idx in range(len(chunk_indices)):
+                        original_idx = restore_order[idx]
+                        seq = sequences[original_idx]
+                        target = targets[original_idx]
+
+                        if np.isfinite(seq).all() and np.isfinite(target).all():
+                            # Ensure correct shapes
+                            seq = seq.reshape(self.sequence_length, -1)
+                            target = target.reshape(-1)
+
+                            # Convert to tensors
+                            seq_tensor = torch.FloatTensor(seq)
+                            target_tensor = torch.FloatTensor(target)
+
+                            yield seq_tensor, target_tensor
+
+        except Exception as e:
+            logger.error(f"Error in dataset iterator: {str(e)}")
+            raise
 
     def __len__(self) -> int:
-        """Return approximate length of dataset"""
+        """Return total number of samples"""
         return self.total_samples
+
+    def _init_storage(self):
+        """Initialize storage with Redis cleanup"""
+        try:
+            # Clear ALL Redis keys to force reprocessing
+            self.redis_client.flushdb()
+            logger.info("Cleared Redis database")
+
+            # Initialize HDF5 file with minimal compression
+            with h5py.File(self.h5_path, 'w') as f:
+                f.create_dataset('sequences',
+                                 shape=(0, self.sequence_length, self.input_size),
+                                 maxshape=(None, self.sequence_length, self.input_size),
+                                 chunks=(100, self.sequence_length, self.input_size),
+                                 dtype='float32',
+                                 compression='gzip',
+                                 compression_opts=1)
+
+                f.create_dataset('targets',
+                                 shape=(0, 1),
+                                 maxshape=(None, 1),
+                                 chunks=(100, 1),
+                                 dtype='float32',
+                                 compression='gzip',
+                                 compression_opts=1)
+
+            logger.info("Storage initialized successfully")
+            logger.info(f"Sequence length: {self.sequence_length}")
+            logger.info(f"Feature count: {self.input_size}")
+
+        except Exception as e:
+            logger.error(f"Error initializing storage: {str(e)}")
+            raise
+
+    def _write_buffer_to_hdf5(self, sequence_buffer: List[np.ndarray],
+                              target_buffer: List[np.ndarray],
+                              current_size: int):
+        """Write buffer to HDF5 with detailed debug logging"""
+        if not sequence_buffer or not target_buffer:
+            logger.warning("Empty buffer received, skipping HDF5 write")
+            return
+
+        try:
+            logger.info(f"Writing buffer - Sequences: {len(sequence_buffer)}, Current size: {current_size}")
+
+            with h5py.File(self.h5_path, 'a') as f:
+                # Convert lists to arrays with validation
+                sequences_array = np.stack(sequence_buffer)
+                targets_array = np.stack(target_buffer)
+
+                logger.info(
+                    f"Arrays created - Sequences shape: {sequences_array.shape}, Targets shape: {targets_array.shape}")
+
+                # Validate arrays
+                if not self._validate_arrays(sequences_array, targets_array):
+                    return
+
+                # Calculate new size
+                new_size = current_size + len(sequences_array)
+                logger.info(f"Resizing datasets to: {new_size}")
+
+                # Resize and write with detailed error handling
+                try:
+                    f['sequences'].resize(new_size, axis=0)
+                    f['targets'].resize(new_size, axis=0)
+
+                    f['sequences'][current_size:new_size] = sequences_array
+                    f['targets'][current_size:new_size] = targets_array
+
+                    logger.info(f"Successfully wrote {len(sequences_array)} sequences")
+
+                except Exception as e:
+                    logger.error(f"Error during HDF5 write operation: {str(e)}")
+                    logger.error(
+                        f"Current dataset shapes - Sequences: {f['sequences'].shape}, Targets: {f['targets'].shape}")
+                    raise
+
+        except Exception as e:
+            logger.error(f"Error in HDF5 write operation: {str(e)}")
+            raise
+
+    def _process_files(self):
+        """Process files with improved data reading"""
+        pipe = self.redis_client.pipeline()
+        total_sequences = 0
+        sequence_buffer = []
+        target_buffer = []
+        buffer_size = 10000
+
+        try:
+            logger.info("\nStarting file processing...")
+            logger.info(f"Total files to process: {len(self.file_paths)}")
+
+            for file_idx, file_path in enumerate(tqdm(self.file_paths, desc="Processing files")):
+                try:
+                    # Read CSV with comma separator
+                    df = pd.read_csv(file_path)
+                    logger.info(f"\nProcessing {Path(file_path).name}")
+                    logger.info(f"Initial shape: {df.shape}")
+                    logger.info(f"Columns: {df.columns.tolist()}")
+
+                    # Process in chunks
+                    chunk_size = self.chunk_size
+                    for i in range(0, len(df), chunk_size):
+                        chunk = df.iloc[i:i + chunk_size].copy()
+                        sequences, targets = self._process_chunk(chunk)
+
+                        if sequences:
+                            sequence_buffer.extend(sequences)
+                            target_buffer.extend(targets)
+
+                            # Write when buffer is full
+                            if len(sequence_buffer) >= buffer_size:
+                                self._write_buffer_to_hdf5(sequence_buffer, target_buffer, total_sequences)
+                                total_sequences += len(sequence_buffer)
+                                sequence_buffer = []
+                                target_buffer = []
+
+                    logger.info(f"Processed file {Path(file_path).name}: Total sequences so far: {total_sequences}")
+
+                except Exception as e:
+                    logger.error(f"Error processing file {file_path}: {str(e)}")
+                    continue
+
+                # Execute Redis commands periodically
+                if file_idx % 5 == 0:
+                    pipe.execute()
+
+            # Write remaining data
+            if sequence_buffer:
+                self._write_buffer_to_hdf5(sequence_buffer, target_buffer, total_sequences)
+                total_sequences += len(sequence_buffer)
+
+            # Save total count
+            pipe.set('total_samples', total_sequences)
+            pipe.execute()
+
+            logger.info(f"\nProcessing completed:")
+            logger.info(f"Total sequences created: {total_sequences}")
+
+            if total_sequences == 0:
+                raise ValueError("No valid sequences were created")
+
+        except Exception as e:
+            logger.error(f"Error in file processing: {str(e)}")
+            raise
+
+    def _verify_input_file(self, file_path: Path) -> bool:
+        """Verify input file format and content"""
+        try:
+            # Read the first few rows
+            df = pd.read_csv(file_path, sep='\t', nrows=5)
+
+            # Log file info
+            logger.info(f"\nVerifying file: {file_path.name}")
+            logger.info(f"File size: {file_path.stat().st_size / (1024 * 1024):.2f} MB")
+            logger.info(f"Column count: {len(df.columns)}")
+            logger.info(f"Available columns: {df.columns.tolist()}")
+
+            # Check for required columns
+            missing_cols = set(self.feature_cols) - set(df.columns)
+            if missing_cols:
+                logger.error(f"Missing required columns: {missing_cols}")
+                return False
+
+            # Check data types
+            logger.info("\nColumn data types:")
+            for col in self.feature_cols:
+                dtype = df[col].dtype
+                logger.info(f"{col}: {dtype}")
+                if not np.issubdtype(dtype, np.number):
+                    logger.error(f"Non-numeric data in column {col}")
+                    return False
+
+            # Check for NaN values
+            nan_cols = df[self.feature_cols].isna().sum()
+            if nan_cols.any():
+                logger.warning(f"NaN values found in columns: {nan_cols[nan_cols > 0]}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error verifying file {file_path}: {str(e)}")
+            return False
 
 
 class StreamingDataLoader:
     """
-    Custom data loader that handles streaming data with prefetching
+    Custom data loader with improved batch handling and memory management
     """
-
     def __init__(self, dataset: ChunkedTrafficDataset, batch_size: int = 32,
                  num_workers: int = 4, prefetch_factor: int = 2):
         self.dataset = dataset
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
+        self.drop_last = False  # Keep partial batches
 
     def _create_batch(self, samples: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Create a batch from a list of samples"""
-        sequences, targets = zip(*samples)
-        return (
-            torch.stack(sequences),
-            torch.stack(targets)
-        )
+        """Create a batch with improved error handling and validation"""
+        if not samples:
+            raise ValueError("Empty batch received")
+
+        try:
+            sequences, targets = zip(*samples)
+            batch_sequences = torch.stack(sequences)
+            batch_targets = torch.stack(targets)
+
+            # Validate batch values with improved handling
+            batch_sequences = torch.nan_to_num(batch_sequences, nan=0.0, posinf=1e6, neginf=-1e6)
+            batch_targets = torch.nan_to_num(batch_targets, nan=0.0, posinf=1e6, neginf=-1e6)
+
+            return batch_sequences, batch_targets
+
+        except Exception as e:
+            logger.error(f"Error creating batch: {e}")
+            raise
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        """Iterate over batches"""
+        """Iterate over batches with improved error handling"""
         batch = []
         for sample in self.dataset:
-            batch.append(sample)
-            if len(batch) == self.batch_size:
-                yield self._create_batch(batch)
-                batch = []
+            try:
+                batch.append(sample)
+                if len(batch) == self.batch_size:
+                    yield self._create_batch(batch)
+                    batch = []
+            except Exception as e:
+                logger.error(f"Error processing sample: {e}")
+                batch = []  # Reset batch on error
+                continue
 
-        # Yield last batch if not empty
-        if batch:
-            yield self._create_batch(batch)
+        # Handle last batch if not empty
+        if batch and not self.drop_last:
+            try:
+                yield self._create_batch(batch)
+            except Exception as e:
+                logger.error(f"Error processing final batch: {e}")
 
     def __len__(self) -> int:
-        """Return approximate number of batches"""
+        """Return number of batches"""
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
 class TrainingMetrics:
@@ -479,6 +1071,10 @@ class TrafficLSTM(nn.Module):
         )
 
     def forward(self, x):
+
+        # Add value checking
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
         # Input shape: (batch_size, sequence_length, features)
         batch_size = x.size(0)
 
@@ -592,7 +1188,7 @@ class TrafficPredictor:
     def _split_data(self, files: List[str], val_ratio: float = 0.2) -> Tuple[List[str], List[str]]:
         """
         Split files into train and validation sets using modulo selection (every 5th file)
-        and copy validation files to a separate directory.
+        and copy validation files to a separate directory if not already present.
 
         Args:
             files: List of file paths
@@ -607,31 +1203,42 @@ class TrafficPredictor:
 
         logger.info(f"Data split - Training files: {len(train_files)}, Validation files: {len(val_files)}")
 
-        # Create validation directory for the district
+        # Extract district number from file path
         district = None
         for file in val_files:
-            # Extract district number from file path
             match = re.search(r'district_(\d+)', file)
             if match:
                 district = match.group(1)
                 break
 
         if district:
-            val_dir = Path(f"F:/PemsData/district_{district}/validation")
+            val_dir = Path(f"E:/PemsData/district_{district}/validation")
             val_dir.mkdir(parents=True, exist_ok=True)
 
-            # Copy validation files to new directory
-            logger.info(f"Copying validation files to {val_dir}")
-            for file in tqdm(val_files, desc="Copying validation files"):
-                # Get the original filename without the path
+            # Check which files need to be copied
+            files_to_copy = []
+            for file in val_files:
                 filename = Path(file).name
-                # Create new path in validation directory
-                new_path = val_dir / filename
-                try:
-                    shutil.copy2(file, new_path)
-                    logger.info(f"Copied {filename} to validation directory")
-                except Exception as e:
-                    logger.error(f"Failed to copy {filename}: {str(e)}")
+                target_path = val_dir / filename
+
+                if not target_path.exists():
+                    files_to_copy.append((file, target_path))
+                else:
+                    logger.info(f"Validation file already exists, skipping: {filename}")
+
+            if files_to_copy:
+                logger.info(f"Copying {len(files_to_copy)} new validation files to {val_dir}")
+                for file, target_path in tqdm(files_to_copy, desc="Copying validation files"):
+                    try:
+                        shutil.copy2(file, target_path)
+                        logger.info(f"Copied {Path(file).name} to validation directory")
+                    except Exception as e:
+                        logger.error(f"Failed to copy {Path(file).name}: {str(e)}")
+            else:
+                logger.info("All validation files already present in target directory")
+
+            # Update val_files to point to the validation directory
+            val_files = [str(val_dir / Path(f).name) for f in val_files]
 
         return train_files, val_files
 
@@ -910,7 +1517,12 @@ class TrafficPredictor:
                         val_progress.update()
 
                 val_progress.close()
-                avg_val_loss = total_val_loss / val_batch_count if val_batch_count > 0 else float('inf')
+                avg_val_loss = validate_with_debugging(
+    model,
+    val_loader,
+    criterion,
+    self.device
+)
 
                 # Calculate epoch time and estimates
                 epoch_time = time.time() - epoch_start_time
