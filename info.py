@@ -17,7 +17,7 @@ from colorama import Fore, Style
 from logger import logger
 from torch import nn
 from tqdm import tqdm
-
+from scipy import stats
 
 def initialize_cli():
     """Initialize command line parser for basic setup"""
@@ -467,25 +467,29 @@ class TrafficAnalyzer:
 
     def predict_traffic(self, date_input, compare_baseline=True):
         """
-        Generate traffic predictions with proper CUDA handling.
+        Generate traffic predictions with comprehensive statistical analysis.
 
-        This method ensures all tensor operations remain on the GPU consistently.
+        This method generates predictions and automatically calculates confidence intervals
+        and other statistical measures needed for visualization and analysis.
+
+        Args:
+            date_input: Date for prediction (can be datetime or date object)
+            compare_baseline: Whether to include historical baseline comparison
+
+        Returns:
+            Dictionary containing predictions and analysis results
         """
         try:
             target_date = date_input.date() if isinstance(date_input, datetime) else date_input
             logger.info(f"Preparing predictions for {target_date}")
 
-            # Generate intervals
+            # Generate prediction intervals
             intervals = pd.date_range(
                 start=datetime.combine(target_date, datetime.min.time()),
                 end=datetime.combine(target_date, datetime.max.time()),
                 freq='5min'
             )
             logger.info(f"Generated {len(intervals)} intervals")
-
-            # Ensure model is in eval mode and on correct device
-            self.model.eval()
-            self.model = self.model.to(self.device)
 
             # Generate predictions
             predictions = []
@@ -497,17 +501,11 @@ class TrafficAnalyzer:
                     batch_predictions = []
 
                     for interval in batch_intervals:
-                        # Prepare sequence (already moved to GPU in _prepare_sequence)
                         sequence = self._prepare_sequence(interval)
-
-                        # Model and sequence are now guaranteed to be on same device
                         output = self.model(sequence)
-
-                        # Move output back to CPU for numpy operations
                         batch_predictions.append(output.cpu().item())
 
                     predictions.extend(batch_predictions)
-                    logger.debug(f"Processed batch {i // batch_size + 1}/{len(intervals) // batch_size + 1}")
 
             predictions = np.array(predictions)
             logger.info(f"Generated {len(predictions)} predictions")
@@ -517,11 +515,19 @@ class TrafficAnalyzer:
             if compare_baseline:
                 baseline_predictions = self._get_baseline_predictions(target_date)
 
+            # Calculate confidence intervals
+            confidence_intervals = self._calculate_confidence_intervals(predictions, baseline_predictions)
+
+            # Generate analysis results
+            analysis_results = self._analyze_predictions(predictions, baseline_predictions)
+
             return {
                 'date': target_date,
                 'intervals': intervals,
                 'predictions': predictions,
-                'baseline_predictions': baseline_predictions
+                'baseline_predictions': baseline_predictions,
+                'confidence_intervals': confidence_intervals,
+                'analysis': analysis_results
             }
 
         except Exception as e:
@@ -667,28 +673,56 @@ class TrafficAnalyzer:
 
     def _calculate_confidence_intervals(self, predictions: np.ndarray,
                                         baseline_predictions: Optional[np.ndarray]) -> Dict:
-        """Calculate confidence intervals for predictions."""
-        std_dev = np.std(predictions)
+        """
+        Calculate confidence intervals for predictions using rolling statistics.
+
+        This provides a more robust confidence interval calculation by considering
+        local variability in the predictions.
+
+        Args:
+            predictions: Array of traffic predictions
+            baseline_predictions: Optional array of baseline predictions
+
+        Returns:
+            Dictionary containing confidence intervals at different levels
+        """
+        # Calculate rolling standard deviation (window of 12 = 1 hour)
+        window_size = 12
+        rolling_std = pd.Series(predictions).rolling(window=window_size, center=True).std()
+        rolling_std = rolling_std.fillna(np.std(predictions))  # Fill edges with overall std
+
         intervals = {
             'model': {
                 '95': {
-                    'lower': predictions - 1.96 * std_dev,
-                    'upper': predictions + 1.96 * std_dev
+                    'lower': predictions - 1.96 * rolling_std,
+                    'upper': predictions + 1.96 * rolling_std
                 },
                 '99': {
-                    'lower': predictions - 2.576 * std_dev,
-                    'upper': predictions + 2.576 * std_dev
+                    'lower': predictions - 2.576 * rolling_std,
+                    'upper': predictions + 2.576 * rolling_std
                 }
             }
         }
 
+        # Add baseline intervals if available
         if baseline_predictions is not None:
-            baseline_std = np.std(baseline_predictions)
+            baseline_rolling_std = pd.Series(baseline_predictions).rolling(
+                window=window_size, center=True).std()
+            baseline_rolling_std = baseline_rolling_std.fillna(np.std(baseline_predictions))
+
             intervals['baseline'] = {
                 '95': {
-                    'lower': baseline_predictions - 1.96 * baseline_std,
-                    'upper': baseline_predictions + 1.96 * baseline_std
+                    'lower': baseline_predictions - 1.96 * baseline_rolling_std,
+                    'upper': baseline_predictions + 1.96 * baseline_rolling_std
                 }
+            }
+
+            # Add statistical comparison
+            t_stat, p_value = stats.ttest_ind(predictions, baseline_predictions)
+            intervals['comparison'] = {
+                't_statistic': float(t_stat),
+                'p_value': float(p_value),
+                'significant_difference': p_value < 0.05
             }
 
         return intervals
