@@ -795,6 +795,120 @@ class TrafficAnalyzer:
 
         return peak_info
 
+    def _analyze_historical_performance(self, start_date: Optional[datetime] = None,
+                                        end_date: Optional[datetime] = None) -> Dict:
+        """
+        Analyze historical traffic prediction performance over a specified time period.
+        If no dates are provided, analyzes the last 30 days.
+
+        Args:
+            start_date: Beginning of analysis period (default: 30 days ago)
+            end_date: End of analysis period (default: today)
+
+        Returns:
+            Dictionary containing comprehensive historical analysis
+        """
+        # Set default date range if not provided
+        if end_date is None:
+            end_date = datetime.now()
+        if start_date is None:
+            start_date = end_date - timedelta(days=30)
+
+        logger.info(f"Analyzing historical performance from {start_date.date()} to {end_date.date()}")
+
+        # Generate list of dates to analyze
+        date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+
+        # Collect predictions and metrics for each day
+        daily_results = []
+        daily_errors = []
+        peak_accuracies = []
+
+        for date in tqdm(date_range, desc="Analyzing historical data"):
+            try:
+                # Get predictions for this day
+                results = self.predict_traffic(date, compare_baseline=True)
+                predictions = results['predictions']
+                baseline = results.get('baseline_predictions')
+
+                # Calculate daily metrics
+                daily_metrics = {
+                    'date': date.date(),
+                    'mean_flow': float(np.mean(predictions)),
+                    'peak_flow': float(np.max(predictions)),
+                    'min_flow': float(np.min(predictions))
+                }
+
+                # Calculate errors if baseline available
+                if baseline is not None:
+                    mae = np.mean(np.abs(predictions - baseline))
+                    mse = np.mean((predictions - baseline) ** 2)
+                    daily_errors.append({
+                        'date': date.date(),
+                        'mae': float(mae),
+                        'mse': float(mse),
+                        'rmse': float(np.sqrt(mse))
+                    })
+
+                # Analyze peak predictions
+                peak_info = self._identify_peak_periods(predictions)
+                peak_accuracies.append({
+                    'date': date.date(),
+                    'morning_peak': peak_info['morning']['flow'],
+                    'evening_peak': peak_info['evening']['flow'],
+                    'peak_ratio': peak_info['overall']['peak_ratio']
+                })
+
+                daily_results.append(daily_metrics)
+
+            except Exception as e:
+                logger.error(f"Error analyzing {date.date()}: {str(e)}")
+                continue
+
+        # Compile comprehensive analysis
+        analysis = {
+            'period': {
+                'start_date': start_date.date(),
+                'end_date': end_date.date(),
+                'total_days': len(daily_results)
+            },
+            'daily_metrics': daily_results,
+            'error_metrics': daily_errors,
+            'peak_analysis': peak_accuracies,
+            'summary_statistics': self._calculate_summary_statistics(daily_results, daily_errors)
+        }
+
+        return analysis
+
+    def _calculate_summary_statistics(self, daily_metrics: List[Dict],
+                                      error_metrics: List[Dict]) -> Dict:
+        """Calculate summary statistics from historical analysis."""
+        # Extract values for analysis
+        mean_flows = [d['mean_flow'] for d in daily_metrics]
+        peak_flows = [d['peak_flow'] for d in daily_metrics]
+
+        summary = {
+            'flow_statistics': {
+                'average_daily_mean': float(np.mean(mean_flows)),
+                'average_daily_peak': float(np.mean(peak_flows)),
+                'flow_variability': float(np.std(mean_flows)),
+                'peak_variability': float(np.std(peak_flows))
+            }
+        }
+
+        # Add error statistics if available
+        if error_metrics:
+            maes = [e['mae'] for e in error_metrics]
+            mses = [e['mse'] for e in error_metrics]
+            summary['error_statistics'] = {
+                'average_mae': float(np.mean(maes)),
+                'average_mse': float(np.mean(mses)),
+                'mae_variability': float(np.std(maes)),
+                'best_day': min(error_metrics, key=lambda x: x['mae'])['date'],
+                'worst_day': max(error_metrics, key=lambda x: x['mae'])['date']
+            }
+
+        return summary
     def _calculate_peak_duration(self, predictions: np.ndarray, peak_hour: int) -> float:
         """
         Calculate the duration of a peak period by finding how long traffic stays above 80% of peak.
@@ -1626,18 +1740,294 @@ class TrafficAnalyzer:
         plt.savefig(vis_dir / 'traffic_clusters.png', dpi=300, bbox_inches='tight')
         plt.close()
 
+    def _plot_historical_trends(self, analysis: Dict, vis_dir: Path):
+        """
+        Create visualization of historical traffic trends over time.
+        Shows daily mean flow, peak flows, and trend lines for easy pattern recognition.
+
+        Args:
+            analysis: Dictionary containing historical analysis results
+            vis_dir: Directory to save visualization
+        """
+        plt.figure(figsize=(15, 10))
+
+        # Extract dates and metrics
+        dates = [pd.to_datetime(metric['date']) for metric in analysis['daily_metrics']]
+        mean_flows = [metric['mean_flow'] for metric in analysis['daily_metrics']]
+        peak_flows = [metric['peak_flow'] for metric in analysis['daily_metrics']]
+
+        # Plot mean and peak flows
+        plt.plot(dates, mean_flows, color='#2C3E50', label='Mean Daily Flow', linewidth=2)
+        plt.plot(dates, peak_flows, color='#E74C3C', label='Peak Daily Flow', linewidth=2)
+
+        # Add trend lines
+        z = np.polyfit(range(len(dates)), mean_flows, 1)
+        p = np.poly1d(z)
+        plt.plot(dates, p(range(len(dates))), '--', color='#2C3E50', alpha=0.5, label='Mean Flow Trend')
+
+        z = np.polyfit(range(len(dates)), peak_flows, 1)
+        p = np.poly1d(z)
+        plt.plot(dates, p(range(len(dates))), '--', color='#E74C3C', alpha=0.5, label='Peak Flow Trend')
+
+        plt.title('Historical Traffic Flow Trends', fontsize=14, pad=20)
+        plt.xlabel('Date', fontsize=12)
+        plt.ylabel('Normalized Flow', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.xticks(rotation=45)
+
+        # Adjust layout to prevent label cutoff
+        plt.tight_layout()
+
+        plt.savefig(vis_dir / 'historical_trends.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def _plot_error_distribution(self, analysis: Dict, vis_dir: Path):
+        """
+        Create visualization of prediction error distribution over time.
+        Updated to use current matplotlib parameter names.
+        """
+        plt.figure(figsize=(15, 10))
+
+        # Extract error metrics if available
+        if not analysis.get('error_metrics'):
+            plt.text(0.5, 0.5, 'No error metrics available',
+                     ha='center', va='center', fontsize=14)
+            plt.savefig(vis_dir / 'error_distribution.png', dpi=300, bbox_inches='tight')
+            plt.close()
+            return
+
+        dates = [pd.to_datetime(metric['date']) for metric in analysis['error_metrics']]
+        maes = [metric['mae'] for metric in analysis['error_metrics']]
+        rmses = [metric['rmse'] for metric in analysis['error_metrics']]
+
+        # Create box plots with updated parameter name
+        plt.subplot(2, 1, 1)
+        plt.boxplot([maes, rmses], tick_labels=['MAE', 'RMSE'])  # Updated parameter name
+        plt.title('Error Distribution Statistics', fontsize=14)
+        plt.grid(True, alpha=0.3)
+
+        # Plot error trends over time
+        plt.subplot(2, 1, 2)
+        plt.plot(dates, maes, color='#3498DB', label='MAE', linewidth=2)
+        plt.plot(dates, rmses, color='#E67E22', label='RMSE', linewidth=2)
+        plt.title('Error Metrics Over Time', fontsize=14)
+        plt.xlabel('Date', fontsize=12)
+        plt.ylabel('Error Magnitude', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.xticks(rotation=45)
+
+        plt.tight_layout()
+        plt.savefig(vis_dir / 'error_distribution.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def _plot_peak_patterns(self, analysis: Dict, vis_dir: Path):
+        """
+        Create visualization of peak traffic patterns over time.
+        Shows evolution of morning and evening peaks and their relationships.
+
+        Args:
+            analysis: Dictionary containing historical analysis results
+            vis_dir: Directory to save visualization
+        """
+        plt.figure(figsize=(15, 10))
+
+        # Extract peak data
+        dates = [pd.to_datetime(metric['date']) for metric in analysis['peak_analysis']]
+        morning_peaks = [metric['morning_peak'] for metric in analysis['peak_analysis']]
+        evening_peaks = [metric['evening_peak'] for metric in analysis['peak_analysis']]
+        peak_ratios = [metric['peak_ratio'] for metric in analysis['peak_analysis']]
+
+        # Plot peak flows
+        plt.subplot(2, 1, 1)
+        plt.plot(dates, morning_peaks, color='#3498DB', label='Morning Peak', linewidth=2)
+        plt.plot(dates, evening_peaks, color='#E67E22', label='Evening Peak', linewidth=2)
+        plt.title('Peak Traffic Patterns Over Time', fontsize=14)
+        plt.ylabel('Peak Flow', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.xticks(rotation=45)
+
+        # Plot peak ratios
+        plt.subplot(2, 1, 2)
+        plt.plot(dates, peak_ratios, color='#2C3E50', linewidth=2)
+        plt.axhline(y=1.0, color='#E74C3C', linestyle='--', alpha=0.5,
+                    label='Equal Peaks Reference')
+        plt.title('Morning/Evening Peak Ratio', fontsize=14)
+        plt.xlabel('Date', fontsize=12)
+        plt.ylabel('Ratio', fontsize=12)
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(vis_dir / 'peak_patterns.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def _generate_historical_report(self, analysis: Dict, report_path: Path):
+        """
+        Generate a comprehensive report of historical traffic analysis.
+
+        This method creates a detailed Markdown report that includes analysis of trends,
+        patterns, and performance metrics over the specified time period. The report
+        combines statistical analysis with insights about traffic patterns.
+
+        Args:
+            analysis: Dictionary containing historical analysis results
+            report_path: Path where the report will be saved
+        """
+        with open(report_path, 'w') as f:
+            # Report Header
+            f.write("# Historical Traffic Analysis Report\n\n")
+            f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+            # Analysis Period
+            period = analysis['period']
+            f.write("## Analysis Period\n\n")
+            f.write(f"- Start Date: {period['start_date']}\n")
+            f.write(f"- End Date: {period['end_date']}\n")
+            f.write(f"- Total Days Analyzed: {period['total_days']}\n\n")
+
+            # Executive Summary
+            f.write("## Executive Summary\n\n")
+            summary = analysis['summary_statistics']
+            f.write("### Traffic Flow Patterns\n\n")
+            f.write(f"- Average Daily Flow: {summary['flow_statistics']['average_daily_mean']:.3f}\n")
+            f.write(f"- Average Peak Flow: {summary['flow_statistics']['average_daily_peak']:.3f}\n")
+            f.write(f"- Flow Variability: {summary['flow_statistics']['flow_variability']:.3f}\n\n")
+
+            if 'error_statistics' in summary:
+                f.write("### Prediction Performance\n\n")
+                f.write(f"- Average MAE: {summary['error_statistics']['average_mae']:.3f}\n")
+                f.write(f"- Average MSE: {summary['error_statistics']['average_mse']:.3f}\n")
+                f.write(f"- Best Performance: {summary['error_statistics']['best_day']}\n")
+                f.write(f"- Most Challenging Day: {summary['error_statistics']['worst_day']}\n\n")
+
+            # Detailed Analysis
+            f.write("## Detailed Analysis\n\n")
+
+            # Traffic Flow Trends
+            f.write("### Daily Traffic Flow Trends\n\n")
+            f.write("| Date | Mean Flow | Peak Flow | Min Flow |\n")
+            f.write("|------|-----------|-----------|----------|\n")
+            for metric in analysis['daily_metrics']:
+                f.write(f"| {metric['date']} | {metric['mean_flow']:.3f} | ")
+                f.write(f"{metric['peak_flow']:.3f} | {metric['min_flow']:.3f} |\n")
+            f.write("\n")
+
+            # Peak Analysis
+            f.write("### Peak Traffic Analysis\n\n")
+            f.write("| Date | Morning Peak | Evening Peak | Peak Ratio |\n")
+            f.write("|------|--------------|--------------|------------|\n")
+            for peak in analysis['peak_analysis']:
+                f.write(f"| {peak['date']} | {peak['morning_peak']:.3f} | ")
+                f.write(f"{peak['evening_peak']:.3f} | {peak['peak_ratio']:.3f} |\n")
+            f.write("\n")
+
+            # Error Analysis if available
+            if analysis.get('error_metrics'):
+                f.write("### Prediction Error Analysis\n\n")
+                f.write("| Date | MAE | MSE | RMSE |\n")
+                f.write("|------|-----|-----|------|\n")
+                for error in analysis['error_metrics']:
+                    f.write(f"| {error['date']} | {error['mae']:.3f} | ")
+                    f.write(f"{error['mse']:.3f} | {error['rmse']:.3f} |\n")
+                f.write("\n")
+
+            # Key Findings and Recommendations
+            f.write("## Key Findings\n\n")
+            findings = self._generate_key_findings(analysis)
+            for finding in findings:
+                f.write(f"- {finding}\n")
+            f.write("\n")
+
+            # Generated Visualizations
+            f.write("## Generated Visualizations\n\n")
+            f.write("The following visualizations have been generated:\n\n")
+            f.write("1. `historical_trends.png`: Shows traffic flow trends over time\n")
+            f.write("2. `error_distribution.png`: Displays prediction error patterns\n")
+            f.write("3. `peak_patterns.png`: Illustrates peak traffic behavior\n\n")
+
+            # Technical Details
+            f.write("## Technical Details\n\n")
+            f.write("### Analysis Parameters\n\n")
+            f.write("- Data granularity: 5-minute intervals\n")
+            f.write("- Metrics computed: Mean flow, peak flow, MAE, MSE, RMSE\n")
+            f.write("- Peak detection window: 1 hour\n")
+
+    def _generate_key_findings(self, analysis: Dict) -> List[str]:
+        """
+        Generate key findings from historical analysis.
+        This method examines the data and extracts meaningful insights.
+        """
+        findings = []
+        summary = analysis['summary_statistics']
+
+        # Analyze overall trends
+        flow_stats = summary['flow_statistics']
+        avg_daily_mean = flow_stats['average_daily_mean']
+        flow_variability = flow_stats['flow_variability']
+
+        # Add findings about traffic patterns
+        findings.append(
+            f"Average daily traffic flow is {avg_daily_mean:.3f} with "
+            f"variability of {flow_variability:.3f}"
+        )
+
+        # Analyze peak patterns
+        peak_ratios = [p['peak_ratio'] for p in analysis['peak_analysis']]
+        avg_ratio = np.mean(peak_ratios)
+        if avg_ratio > 1.1:
+            findings.append(
+                f"Morning peaks tend to be stronger than evening peaks "
+                f"by a factor of {avg_ratio:.2f}"
+            )
+        elif avg_ratio < 0.9:
+            findings.append(
+                f"Evening peaks tend to be stronger than morning peaks "
+                f"by a factor of {1 / avg_ratio:.2f}"
+            )
+
+        # Add error analysis if available
+        if 'error_statistics' in summary:
+            error_stats = summary['error_statistics']
+            findings.append(
+                f"Prediction accuracy shows average MAE of "
+                f"{error_stats['average_mae']:.3f}"
+            )
+
+        return findings
+
+
+def day_to_num(day_name: str) -> int:
+    """Convert day name to number (0-6 where Monday is 0)."""
+    days = {
+        'monday': 0,
+        'tuesday': 1,
+        'wednesday': 2,
+        'thursday': 3,
+        'friday': 4,
+        'saturday': 5,
+        'sunday': 6
+    }
+    return days[day_name.lower()]
+
 
 def main():
-    """Main CLI function with comprehensive analysis capabilities"""
+    """
+    Main CLI function with comprehensive traffic analysis capabilities.
+    Provides interface for various traffic analysis operations including
+    predictions, historical analysis, and report generation.
+    """
     try:
+        # Initialize logging and terminal colors
         logger.info("Starting Traffic Analysis CLI")
         colorama.init()
 
-        # Get paths using setup function
+        # Get configuration paths with interactive input
         model_path, data_dir, save_dir = get_setup_paths()
         logger.info(f"Using paths - Model: {model_path}, Data: {data_dir}, Save: {save_dir}")
 
-        # Initialize analyzer
+        # Initialize traffic analyzer with error handling
         logger.info("Initializing TrafficAnalyzer")
         try:
             analyzer = TrafficAnalyzer(
@@ -1653,40 +2043,133 @@ def main():
             print(f"{Fore.RED}Error initializing analyzer: {str(e)}{Style.RESET_ALL}")
             return 1
 
-        # Main program loop
+        # Main program loop for user interaction
         while True:
             try:
                 choice = display_menu()
 
-                if choice == 0:
+                if choice == 0:  # Exit
                     print(f"{Fore.YELLOW}Exiting...{Style.RESET_ALL}")
                     break
+
+                elif choice == 1:  # Predict traffic for specific date
+                    print(f"\n{Fore.CYAN}Traffic Prediction for Specific Date{Style.RESET_ALL}")
+                    print("-" * 40)
+                    date = get_date_input()
+                    predictions = analyzer.predict_traffic(date, compare_baseline=False)
+                    # Save simple prediction results
+                    report_dir = Path(save_dir) / f"prediction_{date.strftime('%Y%m%d')}"
+                    report_dir.mkdir(parents=True, exist_ok=True)
+                    analyzer._plot_daily_pattern(predictions, report_dir)
+                    print(f"\n{Fore.GREEN}Prediction saved to: {report_dir}{Style.RESET_ALL}")
+
+                elif choice == 2:  # Predict traffic for day of week
+                    print(f"\n{Fore.CYAN}Traffic Prediction for Day of Week{Style.RESET_ALL}")
+                    print("-" * 40)
+                    day = get_day_of_week()
+                    # Calculate next occurrence of this day
+                    today = datetime.now()
+                    days_ahead = day_to_num(day) - today.weekday()
+                    if days_ahead <= 0:
+                        days_ahead += 7
+                    target_date = today + timedelta(days=days_ahead)
+                    predictions = analyzer.predict_traffic(target_date, compare_baseline=True)
+                    report_dir = Path(save_dir) / f"prediction_{day.lower()}"
+                    report_dir.mkdir(parents=True, exist_ok=True)
+                    analyzer._plot_daily_pattern(predictions, report_dir)
+                    print(f"\n{Fore.GREEN}Prediction saved to: {report_dir}{Style.RESET_ALL}")
+
+                elif choice == 3:  # Analyze historical performance
+                    print(f"\n{Fore.CYAN}Historical Performance Analysis{Style.RESET_ALL}")
+                    print("-" * 40)
+
+                    # Get date range with user interaction
+                    print("\nEnter date range for analysis (press Enter to use last 30 days)")
+                    start_date_str = input("Start date (YYYY-MM-DD): ").strip()
+                    end_date_str = input("End date (YYYY-MM-DD or 'today'): ").strip()
+
+                    try:
+                        # Parse and validate dates
+                        start_date = (datetime.strptime(start_date_str, '%Y-%m-%d')
+                                      if start_date_str else None)
+                        end_date = (datetime.now() if end_date_str.lower() == 'today' or not end_date_str
+                                    else datetime.strptime(end_date_str, '%Y-%m-%d'))
+
+                        print(f"\n{Fore.CYAN}Analyzing historical performance...{Style.RESET_ALL}")
+                        analysis = analyzer._analyze_historical_performance(start_date, end_date)
+
+                        # Create output directory structure
+                        report_dir = Path(save_dir) / f"historical_analysis_{datetime.now().strftime('%Y%m%d')}"
+                        report_dir.mkdir(parents=True, exist_ok=True)
+                        vis_dir = report_dir / "visualizations"
+                        vis_dir.mkdir(exist_ok=True)
+
+                        # Generate visualizations and reports
+                        print(f"\n{Fore.CYAN}Generating performance visualizations...{Style.RESET_ALL}")
+                        analyzer._plot_historical_trends(analysis, vis_dir)
+                        analyzer._plot_error_distribution(analysis, vis_dir)
+                        analyzer._plot_peak_patterns(analysis, vis_dir)
+
+                        report_path = report_dir / "historical_analysis_report.md"
+                        analyzer._generate_historical_report(analysis, report_path)
+
+                        print(f"\n{Fore.GREEN}Analysis complete!{Style.RESET_ALL}")
+                        print(f"Report and visualizations saved to: {report_dir}")
+
+                        # Offer to open results directory
+                        if input("\nOpen report directory? (y/n): ").lower().startswith('y'):
+                            import os
+                            os.startfile(report_dir) if os.name == 'nt' else os.system(f'xdg-open {report_dir}')
+
+                    except ValueError as e:
+                        print(f"{Fore.RED}Error: Invalid date format. Please use YYYY-MM-DD.{Style.RESET_ALL}")
+                        continue
+
+                elif choice == 4:  # Generate visualization suite
+                    print(f"\n{Fore.CYAN}Generating Visualization Suite{Style.RESET_ALL}")
+                    print("-" * 40)
+                    date = get_date_input()
+                    predictions = analyzer.predict_traffic(date, compare_baseline=True)
+                    vis_dir = Path(save_dir) / f"visualizations_{date.strftime('%Y%m%d')}"
+                    vis_dir.mkdir(parents=True, exist_ok=True)
+                    analyzer._generate_visualization_suite(predictions, vis_dir)
+                    analyzer._generate_extended_visualization_suite(predictions, vis_dir)
+                    print(f"\n{Fore.GREEN}Visualizations saved to: {vis_dir}{Style.RESET_ALL}")
+
+                elif choice == 5:  # Compare with baseline
+                    print(f"\n{Fore.CYAN}Baseline Comparison Analysis{Style.RESET_ALL}")
+                    print("-" * 40)
+                    date = get_date_input()
+                    predictions = analyzer.predict_traffic(date, compare_baseline=True)
+                    report_dir = Path(save_dir) / f"baseline_comparison_{date.strftime('%Y%m%d')}"
+                    report_dir.mkdir(parents=True, exist_ok=True)
+                    analyzer._plot_historical_comparison(predictions, report_dir)
+                    print(f"\n{Fore.GREEN}Comparison saved to: {report_dir}{Style.RESET_ALL}")
+
                 elif choice == 6:  # Generate full analysis report
                     print(f"\n{Fore.CYAN}Generating Full Analysis Report{Style.RESET_ALL}")
                     print("-" * 40)
 
-                    # Get date for analysis
+                    # Get date and generate predictions
                     date = get_date_input()
                     print(f"\n{Fore.GREEN}Analyzing traffic for {date.strftime('%Y-%m-%d')}{Style.RESET_ALL}")
 
-                    # Create report directory
-                    report_dir = Path(save_dir) / f"report_{date.strftime('%Y%m%d')}"
-                    report_dir.mkdir(parents=True, exist_ok=True)
-
-                    # Generate predictions with baseline comparison
                     print(f"\n{Fore.CYAN}Generating predictions and comparisons...{Style.RESET_ALL}")
                     predictions = analyzer.predict_traffic(date, compare_baseline=True)
 
-                    # Generate visualization suite
+                    # Create report directory structure
+                    report_dir = Path(save_dir) / f"report_{date.strftime('%Y%m%d')}"
+                    report_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Generate visualizations
                     print(f"\n{Fore.CYAN}Creating visualization suite...{Style.RESET_ALL}")
                     vis_dir = report_dir / "visualizations"
                     vis_dir.mkdir(exist_ok=True)
 
-                    # Generate both standard and extended visualizations
                     analyzer._generate_visualization_suite(predictions, vis_dir)
                     analyzer._generate_extended_visualization_suite(predictions, vis_dir)
 
-                    # Generate comprehensive report
+                    # Generate report
                     print(f"\n{Fore.CYAN}Generating comprehensive report...{Style.RESET_ALL}")
                     report_path = analyzer.generate_prediction_report(predictions, report_dir)
 
@@ -1698,12 +2181,10 @@ def main():
                     for vis_file in vis_dir.glob("*.png"):
                         print(f"  - {vis_file.name}")
 
-                    # Ask if user wants to open the report directory
+                    # Offer to open results directory
                     if input("\nOpen report directory? (y/n): ").lower().startswith('y'):
                         import os
                         os.startfile(report_dir) if os.name == 'nt' else os.system(f'xdg-open {report_dir}')
-
-                # Handle other menu options...
 
             except Exception as e:
                 logger.error(f"Error in main loop: {str(e)}")
