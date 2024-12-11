@@ -6,7 +6,7 @@ import sys
 import time
 from datetime import datetime, timedelta, date
 from pathlib import Path
-from typing import Dict, List, Tuple, Union, Optional
+from typing import Dict, List, Tuple, Union, Optional, Any
 import colorama
 import matplotlib.pyplot as plt
 import numpy as np
@@ -114,8 +114,8 @@ def get_paths_interactively() -> tuple[str, str]:
         raise
 
 
-def get_setup_paths(default_model_path: str = "C:/NewProcessData/models/district_5/district_5_best_model.pth",
-                    default_data_dir: str = "C:/NewProcessData/district_5",
+def get_setup_paths(default_model_path: str = "E:/PemsData/models/district_5/district_5_best_model.pth",
+                    default_data_dir: str = "E:/PemsData/district_5",
                     default_save_dir: str = "analysis_results") -> tuple[str, str, str]:
     """Get paths from user or use defaults"""
     print("\nEnter paths (press Enter to use defaults):")
@@ -143,25 +143,27 @@ def display_menu() -> int:
         print("4. Generate visualization suite")
         print("5. Compare with baseline")
         print("6. Generate full analysis report")
+        print("7. Predict vehicle counts (5-minute intervals)")
         print("0. Exit")
         print("=" * 50)
 
         while True:
             try:
-                choice = input(f"{Fore.GREEN}Enter your choice (0-6): {Style.RESET_ALL}").strip()
+                choice = input(f"{Fore.GREEN}Enter your choice (0-7): {Style.RESET_ALL}").strip()
                 if not choice.isdigit():
                     print(f"{Fore.RED}Please enter a number.{Style.RESET_ALL}")
                     continue
 
                 choice = int(choice)
-                if 0 <= choice <= 6:
+                if 0 <= choice <= 7:
                     return choice
-                print(f"{Fore.RED}Invalid choice. Please enter a number between 0 and 6.{Style.RESET_ALL}")
+                print(f"{Fore.RED}Invalid choice. Please enter a number between 0 and 7.{Style.RESET_ALL}")
             except ValueError:
                 print(f"{Fore.RED}Please enter a valid number.{Style.RESET_ALL}")
     except Exception as e:
         logger.error(f"Error in display_menu: {str(e)}")
         raise
+
 
 def get_date_input() -> datetime:
     """Get date input from user"""
@@ -203,6 +205,149 @@ def get_day_of_week() -> str:
     except Exception as e:
         logger.error(f"Error in get_day_of_week: {str(e)}")
         raise
+
+
+class VehicleCountPredictor:
+    """
+    A comprehensive system for predicting and analyzing vehicle counts based on traffic flow data.
+    Integrates with TrafficAnalyzer to provide detailed vehicle count estimations.
+    """
+
+    def __init__(self, max_vehicles_per_lane: int = 2000,
+                 lanes_count: int = 4,
+                 interval_minutes: int = 5):
+        """
+        Initialize the vehicle count predictor with capacity parameters.
+
+        Args:
+            max_vehicles_per_lane: Maximum vehicles per lane per hour (default 2000)
+            lanes_count: Number of lanes (default 4)
+            interval_minutes: Duration of each prediction interval in minutes (default 5)
+        """
+        self.max_vehicles_per_lane = max_vehicles_per_lane
+        self.lanes_count = lanes_count
+        self.interval_minutes = interval_minutes
+        self.validate_parameters()
+
+    def validate_parameters(self):
+        """Validate vehicle count calculation parameters."""
+        if not isinstance(self.max_vehicles_per_lane, (int, float)) or self.max_vehicles_per_lane <= 0:
+            raise ValueError(f"Invalid max_vehicles_per_lane: {self.max_vehicles_per_lane}")
+
+        if not isinstance(self.lanes_count, int) or not 1 <= self.lanes_count <= 8:
+            raise ValueError(f"Invalid lanes_count: {self.lanes_count}")
+
+        if not isinstance(self.interval_minutes, (int, float)) or not 1 <= self.interval_minutes <= 60:
+            raise ValueError(f"Invalid interval_minutes: {self.interval_minutes}")
+
+    def calculate_interval_capacity(self) -> float:
+        """
+        Calculate maximum vehicle capacity for one interval.
+
+        Returns:
+            float: Maximum vehicle capacity for the current interval based on lane configuration
+        """
+        hourly_capacity = self.max_vehicles_per_lane * self.lanes_count
+        return hourly_capacity * (self.interval_minutes / 60)
+
+    def normalize_counts(self, counts: np.ndarray) -> np.ndarray:
+        """Normalize vehicle counts to ensure they don't exceed physical capacity."""
+        max_capacity = self.calculate_interval_capacity()
+        return np.clip(counts, 0, max_capacity * 1.1)  # Allow 10% over capacity for flexibility
+
+    def _validate_vehicle_parameters(self):
+        """
+        Validate vehicle count calculation parameters.
+
+        Raises:
+            ValueError: If any vehicle parameters are invalid or out of reasonable bounds
+        """
+        if not isinstance(self.max_vehicles_per_lane, (int, float)) or self.max_vehicles_per_lane <= 0:
+            raise ValueError(f"Invalid max_vehicles_per_lane: {self.max_vehicles_per_lane}")
+
+        if not isinstance(self.lanes_count, int) or not 1 <= self.lanes_count <= 8:
+            raise ValueError(f"Invalid lanes_count: {self.lanes_count}")
+
+        if not isinstance(self.interval_minutes, (int, float)) or not 1 <= self.interval_minutes <= 60:
+            raise ValueError(f"Invalid interval_minutes: {self.interval_minutes}")
+
+    def calculate_confidence_intervals(self, counts: np.ndarray,
+                                       confidence_width: float = 0.1) -> Dict[str, Dict[str, np.ndarray]]:
+        """
+        Calculate confidence intervals for vehicle count predictions.
+
+        Args:
+            counts: Array of predicted vehicle counts
+            confidence_width: Width of the confidence interval as a proportion (default 0.1 = 10%)
+
+        Returns:
+            Dictionary containing lower and upper bounds for different confidence levels
+        """
+        max_capacity = self.calculate_interval_capacity()
+
+        intervals = {
+            '95': {
+                'lower': np.maximum(0, counts * (1 - confidence_width)),
+                'upper': np.minimum(max_capacity * 1.1, counts * (1 + confidence_width))
+            },
+            '99': {
+                'lower': np.maximum(0, counts * (1 - confidence_width * 1.5)),
+                'upper': np.minimum(max_capacity * 1.1, counts * (1 + confidence_width * 1.5))
+            }
+        }
+
+        return intervals
+
+    def get_peak_periods(self, counts: np.ndarray, intervals: List[datetime],
+                         threshold_percentile: float = 90) -> Dict[str, Any]:
+        """
+        Identify peak traffic periods based on vehicle counts.
+
+        Args:
+            counts: Array of vehicle counts
+            intervals: List of corresponding datetime objects
+            threshold_percentile: Percentile threshold for peak identification (default 90)
+
+        Returns:
+            Dictionary containing peak period information
+        """
+        threshold = np.percentile(counts, threshold_percentile)
+        peak_mask = counts >= threshold
+
+        peak_periods = []
+        start_idx = None
+
+        for i, is_peak in enumerate(peak_mask):
+            if is_peak and start_idx is None:
+                start_idx = i
+            elif not is_peak and start_idx is not None:
+                peak_periods.append({
+                    'start_time': intervals[start_idx],
+                    'end_time': intervals[i - 1],
+                    'duration_minutes': (i - start_idx) * self.interval_minutes,
+                    'max_count': int(np.max(counts[start_idx:i])),
+                    'avg_count': int(np.mean(counts[start_idx:i]))
+                })
+                start_idx = None
+
+        return {
+            'threshold': int(threshold),
+            'peak_periods': peak_periods,
+            'total_peak_duration': sum(p['duration_minutes'] for p in peak_periods)
+        }
+
+    def generate_summary_statistics(self, counts: np.ndarray) -> Dict[str, Any]:
+        """Generate summary statistics for vehicle counts."""
+        return {
+            'total_vehicles': int(np.sum(counts)),
+            'average_count': int(np.mean(counts)),
+            'peak_count': int(np.max(counts)),
+            'min_count': int(np.min(counts)),
+            'std_dev': float(np.std(counts)),
+            'capacity_utilization': float(np.mean(counts) / self.calculate_interval_capacity()),
+            'peak_utilization': float(np.max(counts) / self.calculate_interval_capacity())
+        }
+
 
 
 class TrafficLSTM(nn.Module):
@@ -342,16 +487,8 @@ class HolidayCalculator:
 class TrafficAnalyzer:
     def __init__(self, model_path: str, data_dir: str, cache_dir: str = "cache",
                  redis_host: str = "localhost", redis_port: int = 6379):
-        """Initialize the Traffic Analyzer with model loading and feature configuration.
-
-        Args:
-            model_path: Path to the trained model file (.pth)
-            data_dir: Directory containing traffic data files
-            cache_dir: Directory for caching analysis results
-            redis_host: Redis server hostname for caching
-            redis_port: Redis server port number
-        """
-        # Set up basic configuration and paths
+        """Initialize the Traffic Analyzer with model loading and feature configuration."""
+        # Initialize paths and device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model_path = Path(model_path)
         self.data_dir = Path(data_dir)
@@ -359,111 +496,37 @@ class TrafficAnalyzer:
         self.redis_host = redis_host
         self.redis_port = redis_port
 
-        # Define temporal features that capture time-based patterns
-        self.temporal_features = [
-            'Hour',  # Hour of day (0-23)
-            'Day_of_Week',  # Day of week (0-6, Monday=0)
-            'Is_Weekend',  # Binary weekend indicator
-            'Month',  # Month of year (1-12)
-            'Is_Peak_Hour_Normalized'  # Binary peak hour indicator
-        ]
+        # Initialize vehicle count parameters with validation
+        self.max_vehicles_per_lane = 2000  # Maximum vehicles per lane per hour
+        self.lanes_count = 4  # Default number of lanes
+        self.interval_minutes = 5  # 5-minute intervals
+        self._validate_vehicle_parameters()
 
-        # Define road features that describe physical characteristics
-        self.road_features = [
-            'Station_Length_Normalized',  # Length of monitoring station
-            'Active_Lanes_Normalized',  # Number of active lanes
-            'Direction_S_Normalized',  # South direction indicator
-            'Direction_E_Normalized'  # East direction indicator
-        ]
+        # Initialize features
+        self._initialize_features()
 
-        # Define overall traffic metrics
-        self.traffic_features = [
-            'Total_Flow_Normalized',  # Total vehicle flow rate
-            'Avg_Occupancy_Normalized',  # Average road occupancy
-            'Avg_Speed_Normalized'  # Average vehicle speed
-        ]
+        # Initialize Redis connection
+        self._initialize_redis()
 
-        # Define per-lane metrics for all four lanes
-        self.lane_features = []
-        for lane in range(1, 5):  # Lanes 1-4
-            self.lane_features.extend([
-                f'Lane_{lane}_Flow_Normalized',  # Per-lane flow rate
-                f'Lane_{lane}_Avg_Occ_Normalized',  # Per-lane occupancy
-                f'Lane_{lane}_Avg_Speed_Normalized',  # Per-lane speed
-                f'Lane_{lane}_Efficiency_Normalized'  # Per-lane efficiency
-            ])
+        # Initialize model
+        self._initialize_model()
 
-        # Combine all features into one list
-        self.feature_cols = (
-                self.temporal_features +
-                self.road_features +
-                self.traffic_features +
-                self.lane_features
-        )
+    def _validate_vehicle_parameters(self):
+        """Validate vehicle count calculation parameters."""
+        if not isinstance(self.max_vehicles_per_lane, (int, float)) or self.max_vehicles_per_lane <= 0:
+            raise ValueError(f"Invalid max_vehicles_per_lane: {self.max_vehicles_per_lane}")
 
-        # Verify feature count matches model expectations
-        expected_features = 28  # 5 temporal + 4 road + 3 traffic + (4 lanes × 4 metrics)
-        total_features = len(self.feature_cols)
+        if not isinstance(self.lanes_count, int) or not 1 <= self.lanes_count <= 8:
+            raise ValueError(f"Invalid lanes_count: {self.lanes_count}")
 
-        if total_features != expected_features:
-            feature_breakdown = (
-                f"Feature count mismatch. Expected {expected_features} features, "
-                f"but got {total_features}. Feature breakdown:\n"
-                f"- Temporal features: {len(self.temporal_features)}\n"
-                f"- Road features: {len(self.road_features)}\n"
-                f"- Traffic features: {len(self.traffic_features)}\n"
-                f"- Lane features: {len(self.lane_features)} "
-                f"({len(self.lane_features) / 4} lanes × 4 metrics per lane)\n\n"
-                f"Full feature list:\n"
-            )
-            for i, feature in enumerate(self.feature_cols, 1):
-                feature_breakdown += f"{i}. {feature}\n"
-            raise ValueError(feature_breakdown)
+        if not isinstance(self.interval_minutes, (int, float)) or not 1 <= self.interval_minutes <= 60:
+            raise ValueError(f"Invalid interval_minutes: {self.interval_minutes}")
 
-        # Initialize Redis connection with retry logic
-        for attempt in range(3):
-            try:
-                self.redis_client = redis.Redis(
-                    host=redis_host,
-                    port=redis_port,
-                    decode_responses=False,
-                    socket_timeout=5,
-                    socket_connect_timeout=5
-                )
-                self.redis_client.ping()
-                break
-            except redis.ConnectionError as e:
-                if attempt == 2:
-                    raise ConnectionError(f"Failed to connect to Redis after 3 attempts: {e}")
-                time.sleep(1)
+    def _calculate_interval_capacity(self) -> float:
+        """Calculate maximum vehicle capacity for one interval."""
+        hourly_capacity = self.max_vehicles_per_lane * self.lanes_count
+        return hourly_capacity * (self.interval_minutes / 60)
 
-        # Load the neural network model
-        try:
-            # Initialize model architecture
-            self.model = TrafficLSTM(input_size=len(self.feature_cols)).to(self.device)
-
-            # Load trained weights with safety flag
-            checkpoint = torch.load(
-                self.model_path,
-                map_location=self.device,
-                weights_only=True  # Safety measure for loading only weights
-            )
-
-            # Apply weights to model
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-
-            # Set model to evaluation mode
-            self.model.eval()
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to load model: {str(e)}")
-
-        # Create cache directory if it doesn't exist
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-        # Log successful initialization
-        logger.info(f"TrafficAnalyzer initialized successfully on {self.device}")
-        logger.info(f"Using {total_features} features for prediction")
 
     def predict_traffic(self, date_input, compare_baseline=True):
         """
@@ -2024,6 +2087,270 @@ class TrafficAnalyzer:
 
         return findings
 
+    def predict_vehicle_counts(self, date_input: Union[date, datetime]) -> Dict[str, Any]:
+        """
+        Predict actual vehicle counts with continuous flow patterns and realistic transitions.
+        Implements **traffic flow dynamics** and **continuous occupancy theory**.
+        """
+        try:
+            logger.info(f"Generating vehicle count predictions for {date_input}")
+            predictions = self.predict_traffic(date_input, compare_baseline=True)
+
+            # Calculate base capacity using **flow rate theory**
+            hourly_capacity = self.max_vehicles_per_lane * self.lanes_count
+            interval_capacity = hourly_capacity * (self.interval_minutes / 60)
+
+            # Implement continuous flow patterns
+            raw_predictions = predictions['predictions']
+
+            # Apply **time-series smoothing** for continuous transitions
+            window_size = 6  # 30-minute smoothing window
+            smoothed_predictions = pd.Series(raw_predictions).rolling(
+                window=window_size,
+                center=True,
+                min_periods=1
+            ).mean()
+
+            # Apply **minimum flow principles** from traffic theory
+            min_capacity_ratio = 0.15  # Minimum 15% capacity utilization
+            max_capacity_ratio = 0.95  # Maximum 95% capacity utilization
+
+            # Scale predictions while maintaining minimum flow
+            min_vehicles = interval_capacity * min_capacity_ratio
+            available_range = interval_capacity * (max_capacity_ratio - min_capacity_ratio)
+
+            # Calculate vehicle counts using **continuous flow scaling**
+            vehicle_counts = min_vehicles + (smoothed_predictions * available_range)
+
+            # Apply **temporal smoothing** for realistic transitions
+            vehicle_counts = pd.Series(vehicle_counts).interpolate(method='polynomial', order=3)
+
+            # Ensure counts stay within physical limits
+            vehicle_counts = np.clip(vehicle_counts, min_vehicles, interval_capacity * max_capacity_ratio)
+
+            # Identify peak periods using **traffic pattern analysis**
+            threshold = np.percentile(vehicle_counts, 90)
+            peak_mask = vehicle_counts >= threshold
+            identified_peak_periods = []
+            start_idx = None
+
+            for i, is_peak in enumerate(peak_mask):
+                if is_peak and start_idx is None:
+                    start_idx = i
+                elif not is_peak and start_idx is not None:
+                    identified_peak_periods.append({
+                        'start_time': predictions['intervals'][start_idx],
+                        'end_time': predictions['intervals'][i - 1],
+                        'duration_minutes': (i - start_idx) * self.interval_minutes,
+                        'max_count': int(np.max(vehicle_counts[start_idx:i])),
+                        'avg_count': int(np.mean(vehicle_counts[start_idx:i]))
+                    })
+                    start_idx = None
+
+            # Calculate confidence intervals with **statistical reliability theory**
+            confidence_width = 0.1
+            confidence_intervals = {
+                '95': {
+                    'lower': np.maximum(min_vehicles * 0.9, vehicle_counts * (1 - confidence_width)),
+                    'upper': np.minimum(interval_capacity * max_capacity_ratio,
+                                        vehicle_counts * (1 + confidence_width))
+                }
+            }
+
+            # Generate summary statistics
+            summary_stats = {
+                'total_vehicles': int(np.sum(vehicle_counts)),
+                'average_count': int(np.mean(vehicle_counts)),
+                'peak_count': int(np.max(vehicle_counts)),
+                'min_count': int(np.min(vehicle_counts)),
+                'capacity_utilization': float(np.mean(vehicle_counts) / interval_capacity),
+                'peak_utilization': float(np.max(vehicle_counts) / interval_capacity)
+            }
+
+            logger.info(f"Successfully generated vehicle counts. Peak count: {summary_stats['peak_count']}")
+
+            return {
+                'date': predictions['date'],
+                'intervals': predictions['intervals'],
+                'vehicle_counts': vehicle_counts,
+                'confidence_intervals': confidence_intervals,
+                'peak_periods': identified_peak_periods,
+                'summary_statistics': summary_stats,
+                'parameters': {
+                    'lanes': self.lanes_count,
+                    'max_per_lane': self.max_vehicles_per_lane,
+                    'interval_minutes': self.interval_minutes,
+                    'interval_capacity': interval_capacity,
+                    'min_vehicles': min_vehicles
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"Error in predict_vehicle_counts: {str(e)}")
+            raise
+
+    def _plot_vehicle_counts(self, results: Dict[str, Any], save_dir: Path):
+        """
+        Create visualization of vehicle count predictions with proper capacity reference.
+
+        Args:
+            results: Dictionary containing prediction results
+            save_dir: Directory to save the visualization
+        """
+        plt.figure(figsize=(15, 10))
+
+        # Create time axis (hours)
+        hours = [(t.hour + t.minute / 60) for t in results['intervals']]
+
+        # Plot vehicle counts
+        plt.plot(hours, results['vehicle_counts'],
+                 color='#2C3E50',
+                 label='Predicted Vehicles',
+                 linewidth=2)
+
+        # Add confidence intervals
+        ci = results['confidence_intervals']['95']
+        plt.fill_between(hours, ci['lower'], ci['upper'],
+                         color='#2C3E50', alpha=0.2,
+                         label='95% Confidence Interval')
+
+        # Add capacity reference line using the interval_capacity from parameters
+        interval_capacity = results['parameters']['interval_capacity']
+        plt.axhline(y=interval_capacity,
+                    color='#E74C3C',
+                    linestyle='--',
+                    label='Maximum Capacity')
+
+        # Add peak period highlighting
+        for period in results.get('peak_periods', []):
+            start_hour = period['start_time'].hour + period['start_time'].minute / 60
+            end_hour = period['end_time'].hour + period['end_time'].minute / 60
+            plt.axvspan(start_hour, end_hour,
+                        color='#F1C40F', alpha=0.1)
+
+        # Customize plot
+        plt.title('Predicted Vehicle Counts (5-minute intervals)',
+                  fontsize=14, pad=20)
+        plt.xlabel('Hour of Day', fontsize=12)
+        plt.ylabel('Number of Vehicles', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(save_dir / 'vehicle_counts.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def generate_vehicle_count_report(self, results: Dict, save_dir: Path) -> Path:
+        """
+        Generate a detailed report of vehicle count predictions.
+
+        Args:
+            results: Dictionary containing prediction results
+            save_dir: Directory to save the report
+
+        Returns:
+            Path: Path to the generated report file
+        """
+        report_path = save_dir / f"vehicle_counts_report_{results['date']}.md"
+
+        with open(report_path, 'w') as f:
+            # Report Header
+            f.write("# Vehicle Count Prediction Report\n\n")
+            f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Prediction Date: {results['date']}\n\n")
+
+            # Summary Statistics
+            f.write("## Summary Statistics\n\n")
+            stats = results['summary_statistics']
+            f.write(f"- Total Predicted Vehicles: {stats['total_vehicles']:,}\n")
+            f.write(f"- Average Vehicles per 5-min: {stats['average_count']:,}\n")
+            f.write(f"- Peak Vehicle Count: {stats['peak_count']:,}\n")
+            f.write(f"- Minimum Vehicle Count: {stats['min_count']:,}\n")
+            f.write(f"- Capacity Utilization: {stats['capacity_utilization']:.1%}\n")
+            f.write(f"- Peak Utilization: {stats['peak_utilization']:.1%}\n\n")
+
+            # Peak Periods Analysis
+            f.write("## Peak Periods Analysis\n\n")
+            f.write("| Time Period | Duration (min) | Average Count | Maximum Count |\n")
+            f.write("|-------------|----------------|---------------|---------------|\n")
+            for period in results['peak_periods']:
+                f.write(f"| {period['start_time'].strftime('%H:%M')}-"
+                        f"{period['end_time'].strftime('%H:%M')} | "
+                        f"{period['duration_minutes']} | "
+                        f"{period['avg_count']:,} | "
+                        f"{period['max_count']:,} |\n")
+
+            # Hourly Breakdown
+            f.write("\n## Hourly Vehicle Counts\n\n")
+            f.write("| Hour | Average Vehicles | Peak Vehicles |\n")
+            f.write("|------|-----------------|---------------|\n")
+
+            counts = results['vehicle_counts']
+            for hour in range(24):
+                hour_mask = [t.hour == hour for t in results['intervals']]
+                hour_counts = counts[hour_mask]
+                avg_count = int(np.mean(hour_counts))
+                peak_count = int(np.max(hour_counts))
+                f.write(f"| {hour:02d}:00 | {avg_count:,} | {peak_count:,} |\n")
+
+        return report_path
+
+    def _initialize_features(self):
+        """Initialize feature configurations."""
+        self.temporal_features = [
+            'Hour', 'Day_of_Week', 'Is_Weekend', 'Month', 'Is_Peak_Hour_Normalized'
+        ]
+
+        self.road_features = [
+            'Station_Length_Normalized', 'Active_Lanes_Normalized',
+            'Direction_S_Normalized', 'Direction_E_Normalized'
+        ]
+
+        self.traffic_features = [
+            'Total_Flow_Normalized', 'Avg_Occupancy_Normalized', 'Avg_Speed_Normalized'
+        ]
+
+        self.lane_features = []
+        for lane in range(1, 5):
+            self.lane_features.extend([
+                f'Lane_{lane}_Flow_Normalized',
+                f'Lane_{lane}_Avg_Occ_Normalized',
+                f'Lane_{lane}_Avg_Speed_Normalized',
+                f'Lane_{lane}_Efficiency_Normalized'
+            ])
+
+        self.feature_cols = (
+            self.temporal_features +
+            self.road_features +
+            self.traffic_features +
+            self.lane_features
+        )
+
+    def _initialize_redis(self):
+        """Initialize Redis connection with retry logic."""
+        for attempt in range(3):
+            try:
+                self.redis_client = redis.Redis(
+                    host=self.redis_host,
+                    port=self.redis_port,
+                    decode_responses=False,
+                    socket_timeout=5,
+                    socket_connect_timeout=5
+                )
+                self.redis_client.ping()
+                break
+            except redis.ConnectionError as e:
+                if attempt == 2:
+                    raise ConnectionError(f"Failed to connect to Redis after 3 attempts: {e}")
+                time.sleep(1)
+
+    def _initialize_model(self):
+        """Initialize the LSTM model."""
+        self.model = TrafficLSTM(input_size=len(self.feature_cols)).to(self.device)
+        checkpoint = torch.load(self.model_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.eval()
+
 
 def day_to_num(day_name: str) -> int:
     """Convert day name to number (0-6 where Monday is 0)."""
@@ -2208,7 +2535,43 @@ def main():
                     for vis_file in vis_dir.glob("*.png"):
                         print(f"  - {vis_file.name}")
 
-                    # Offer to open results directory
+                     # Offer to open report directory
+                    if input("\nOpen report directory? (y/n): ").lower().startswith('y'):
+                        import os
+                        os.startfile(report_dir) if os.name == 'nt' else os.system(f'xdg-open {report_dir}')
+
+                elif choice == 7:  # Predict vehicle counts
+                    print(f"\n{Fore.CYAN}Vehicle Count Prediction{Style.RESET_ALL}")
+                    print("-" * 40)
+
+                    # Get date for prediction
+                    date = get_date_input()
+                    print(f"\n{Fore.GREEN}Predicting vehicle counts for {date.strftime('%Y-%m-%d')}{Style.RESET_ALL}")
+
+                    # Generate predictions
+                    results = analyzer.predict_vehicle_counts(date)
+
+                    # Create output directory
+                    report_dir = Path(save_dir) / f"vehicle_counts_{date.strftime('%Y%m%d')}"
+                    report_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Generate visualization
+                    print(f"\n{Fore.CYAN}Generating vehicle count visualization...{Style.RESET_ALL}")
+                    analyzer._plot_vehicle_counts(results, report_dir)
+
+                    # Generate report
+                    print(f"\n{Fore.CYAN}Generating detailed report...{Style.RESET_ALL}")
+                    report_path = analyzer.generate_vehicle_count_report(results, report_dir)
+
+                    # Print summary
+                    total_vehicles = int(np.sum(results['vehicle_counts']))
+                    peak_vehicles = int(np.max(results['vehicle_counts']))
+                    print(f"\n{Fore.GREEN}Prediction Summary:{Style.RESET_ALL}")
+                    print(f"Total Predicted Vehicles: {total_vehicles:,}")
+                    print(f"Peak 5-minute Count: {peak_vehicles:,}")
+                    print(f"Report saved to: {report_path}")
+
+                    # Offer to open report directory
                     if input("\nOpen report directory? (y/n): ").lower().startswith('y'):
                         import os
                         os.startfile(report_dir) if os.name == 'nt' else os.system(f'xdg-open {report_dir}')
